@@ -27646,7 +27646,8 @@ KBTS_EXPORT int kbts_FontCount(void *Data, int Size)
 
   if(Data && (Size >= 4))
   {
-    kbts_u32 Magic = *(kbts_u32 *)Data;
+    // The caller's buffer need not be aligned: a font embedded in a file rarely is.
+    kbts_u32 Magic = kbts__ReadU32Unaligned((kbts_u32 *)Data);
 
     if(Magic == KBTS_FOURCC('t', 't', 'c', 'f'))
     {
@@ -27751,7 +27752,8 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
   if(FontDataSize >= 4)
   {
     char *FileEnd = (char *)FontData + FontDataSize;
-    kbts_u32 Magic = *(kbts_u32 *)FontData;
+    // The caller's buffer need not be aligned: a font embedded in a file rarely is.
+    kbts_u32 Magic = kbts__ReadU32Unaligned((kbts_u32 *)FontData);
     kbts_un DirectoryOffset = 0;
 
     if(Magic == KBTS_FOURCC('t', 't', 'c', 'f'))
@@ -27767,7 +27769,7 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
            ((kbts_un)FontDataSize >= (sizeof(kbts__ttc_header) + sizeof(kbts_u32) * FontCount)))
         {
           kbts_u32 *TableDirectoryOffsets = KBTS__POINTER_AFTER(kbts_u32, Header);
-          DirectoryOffset = kbts__ByteSwap32(TableDirectoryOffsets[FontIndex]);
+          DirectoryOffset = kbts__ByteSwap32(kbts__ReadU32Unaligned(&TableDirectoryOffsets[FontIndex]));
 
           Magic = KBTS__U32BE(0x10000);
         }
@@ -27876,7 +27878,7 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
 
               KBTS__FOR(LookupIndex, 0, LookupCount)
               {
-                kbts__lookup *Lookup = KBTS__POINTER_OFFSET(kbts__lookup, LookupList, kbts__ByteSwap16(LookupOffsets[LookupIndex]));
+                kbts__lookup *Lookup = KBTS__POINTER_OFFSET(kbts__lookup, LookupList, kbts__ByteSwap16(kbts__ReadU16Unaligned(&LookupOffsets[LookupIndex])));
 
                 TotalSubtableCount += kbts__ByteSwap16(Lookup->SubtableCount);
               }
