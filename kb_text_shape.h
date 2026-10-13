@@ -18726,6 +18726,13 @@ KBTS_EXPORT kbts_un kbts_SizeOfShapeScratchpad(kbts_shape_config *Config)
 
 KBTS_EXPORT kbts_shape_scratchpad *kbts_PlaceShapeScratchpad(kbts_shape_config *Config, void *Memory, kbts_allocator_function *Allocator, void *AllocatorData)
 {
+  // As documented: no memory, no scratchpad. A failed allocation in
+  // kbts_CreateShapeScratchpad arrives here as a null Memory.
+  if(!Memory)
+  {
+    return 0;
+  }
+
   kbts__pointer_bump_allocator Bump = kbts__PointerBumpAllocator(Memory);
   kbts_shape_scratchpad *Result = kbts__PointerPushType(&Bump, kbts_shape_scratchpad);
   KBTS_MEMSET(Result, 0, sizeof(*Result));
@@ -18815,7 +18822,10 @@ KBTS_EXPORT kbts_shape_scratchpad *kbts_CreateShapeScratchpad(kbts_shape_config 
 {
   kbts_un Size = kbts_SizeOfShapeScratchpad(Config);
   kbts_shape_scratchpad *Result = kbts_PlaceShapeScratchpad(Config, kbts__AllocatorAllocate(Allocator, AllocatorData, Size), Allocator, AllocatorData);
-  Result->SelfAllocated = 1;
+  if(Result)
+  {
+    Result->SelfAllocated = 1;
+  }
   return Result;
 }
 
@@ -18871,7 +18881,10 @@ static kbts_shape_scratchpad *kbts__CreateShapeScratchpad(kbts_shape_config *Con
 {
   kbts_un ScratchpadSize = kbts_SizeOfShapeScratchpad(Config);
   kbts_shape_scratchpad *Result = kbts_PlaceShapeScratchpad(Config, kbts__AllocatorAllocate(Allocator, AllocatorData, ScratchpadSize), Allocator, AllocatorData);
-  Result->SelfAllocated = 1;
+  if(Result)
+  {
+    Result->SelfAllocated = 1;
+  }
 
   return Result;
 }
@@ -18894,6 +18907,12 @@ static kbts__bucketed_glyph *kbts__InsertGlyphIntoBucket(kbts_shape_scratchpad *
     {
       KBTS__DLLIST_INSERT_BEFORE(&NewBlock->Header, Sentinel);
       Header = &NewBlock->Header;
+    }
+    else
+    {
+      // kbts__NewBucketedGlyphBlock has set Scratchpad->Error. The last block is
+      // full, or there is none, so writing below would go past its end.
+      return 0;
     }
   }
 
@@ -25058,8 +25077,11 @@ KBTS_EXPORT kbts_shape_context *kbts_CreateShapeContext2(kbts_allocator_function
   }
 
   kbts_shape_context *Result = kbts_PlaceShapeContext2(Allocator, AllocatorData, kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)kbts_SizeOfShapeContext()), Flags);
-  Result->SelfAllocator = Allocator;
-  Result->SelfAllocatorData = AllocatorData;
+  if(Result)
+  {
+    Result->SelfAllocator = Allocator;
+    Result->SelfAllocatorData = AllocatorData;
+  }
   return Result;
 }
 
@@ -27515,6 +27537,16 @@ static int kbts__ShapeRun(kbts_shape_context *Context, kbts_run *Run, int Versio
         // @Memory: Store this alongside the shape_config!
         kbts_un ScratchpadSize = kbts_SizeOfShapeScratchpad(ShapeConfig);
         kbts_shape_scratchpad *Scratchpad = kbts_PlaceShapeScratchpad(ShapeConfig, kbts__PushSize(&Context->ScratchArena, ScratchpadSize, 8), kbts__ArenaAllocator, &Context->ScratchArena);
+
+        // A glyph that could not be pushed (kbts_PushGlyph returned 0 above) or a
+        // scratchpad that could not be allocated must fail the run. Without this
+        // check the run was shaped with glyphs missing and reported no error.
+        if(Context->GlyphStorage.Error || !Scratchpad)
+        {
+          Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+          return 0;
+        }
 
         if(!RunFontInfo->VariationVectorNormalized)
         {
