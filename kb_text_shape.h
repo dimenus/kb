@@ -27891,7 +27891,28 @@ KBTS_EXPORT int kbts_FontIsValid(kbts_font *Font)
   return Result;
 }
 
-static void kbts__MarkMatrixCoverage(kbts_u32 *Matrix, kbts_un TableIndex, kbts_un TableCount, kbts_un GlyphCount, kbts__coverage *Coverage, int SubtableMatrix)
+// Baking the lookup matrices costs one step per glyph a coverage, class definition
+// or rule names. Offsets in a font can point many records at the same data, so a
+// small malformed file can ask for billions of steps (a HarfBuzz test font took
+// more than four minutes). The work is capped in proportion to the file size,
+// the way HarfBuzz caps its sanitizer (HB_SANITIZE_MAX_OPS_FACTOR is also 64),
+// and a font that needs more is rejected as invalid. Measured: the heaviest of
+// 367 installed macOS fonts and HarfBuzz's 502 loadable test fonts used 1.18
+// steps per byte (NotoSansSiddham) and at most 111050 steps in total.
+#ifndef KBTS_BAKE_OPS_FACTOR
+#  define KBTS_BAKE_OPS_FACTOR 64
+#endif
+#ifndef KBTS_BAKE_OPS_MIN
+#  define KBTS_BAKE_OPS_MIN (1 << 20)
+#endif
+
+typedef struct kbts__bake_budget
+{
+  kbts_un Ops;
+  kbts_un Max;
+} kbts__bake_budget;
+
+static void kbts__MarkMatrixCoverage(kbts_u32 *Matrix, kbts_un TableIndex, kbts_un TableCount, kbts_un GlyphCount, kbts__coverage *Coverage, int SubtableMatrix, kbts__bake_budget *Budget)
 {
   if(Coverage)
   {
@@ -27901,6 +27922,10 @@ static void kbts__MarkMatrixCoverage(kbts_u32 *Matrix, kbts_un TableIndex, kbts_
 
       KBTS__FOR(GlyphIndex, 0, Coverage->Count)
       {
+        if(++Budget->Ops > Budget->Max)
+        {
+          return;
+        }
         kbts_un GlyphId = kbts__ReadU16Unaligned(&GlyphIds[GlyphIndex]);
         kbts__matrix_index MatrixIndex = SubtableMatrix ? 
           kbts__GlyphLookupSubtableMatrixIndex(TableIndex, TableCount, GlyphId, GlyphCount) :
@@ -27919,8 +27944,16 @@ static void kbts__MarkMatrixCoverage(kbts_u32 *Matrix, kbts_un TableIndex, kbts_
       KBTS__FOR(RangeIndex, 0, Coverage->Count)
       {
         kbts__range_record *Range = &Ranges[RangeIndex];
-        KBTS__FOR(GlyphId, Range->StartGlyphId, (kbts_un)Range->EndGlyphId + 1)
+        // Clamped like kbts__MarkMatrixClassDef does: a malformed range can name up
+        // to 65535 glyphs the font does not have, and many such ranges multiply
+        // into minutes of work for nothing.
+        kbts_un OnePastLastGlyphId = KBTS__MIN((kbts_un)Range->EndGlyphId + 1, GlyphCount);
+        KBTS__FOR(GlyphId, Range->StartGlyphId, OnePastLastGlyphId)
         {
+          if(++Budget->Ops > Budget->Max)
+          {
+            return;
+          }
           kbts__matrix_index MatrixIndex = SubtableMatrix ? 
             kbts__GlyphLookupSubtableMatrixIndex(TableIndex, TableCount, GlyphId, GlyphCount) :
             kbts__GlyphLookupMatrixIndex(TableIndex, GlyphId, GlyphCount);
@@ -27935,7 +27968,7 @@ static void kbts__MarkMatrixCoverage(kbts_u32 *Matrix, kbts_un TableIndex, kbts_
   }
 }
 
-static void kbts__MarkMatrixClassDef(kbts_u32 *Matrix, kbts_un SubtableIndex, kbts_un SubtableCount, kbts_un GlyphCount, kbts_u16 *ClassDefBase, kbts_u64 *ClassesIncluded, kbts_un ClassesIncludedLength)
+static void kbts__MarkMatrixClassDef(kbts_u32 *Matrix, kbts_un SubtableIndex, kbts_un SubtableCount, kbts_un GlyphCount, kbts_u16 *ClassDefBase, kbts_u64 *ClassesIncluded, kbts_un ClassesIncludedLength, kbts__bake_budget *Budget)
 {
   if(ClassDefBase)
   {
@@ -27946,11 +27979,20 @@ static void kbts__MarkMatrixClassDef(kbts_u32 *Matrix, kbts_un SubtableIndex, kb
 
       KBTS__FOR(GlyphIndex, 0, ClassDef->GlyphCount)
       {
-        kbts_un GlyphId = ClassDef->StartGlyphId + GlyphIndex;
-        kbts_un GlyphClass = GlyphClasses[GlyphIndex];
+        if(++Budget->Ops > Budget->Max)
+        {
+          return;
+        }
 
-        if((GlyphId >= (ClassesIncludedLength * 64)) ||
-           (ClassesIncluded[GlyphClass / 64] & (1ull << (GlyphClass % 64))))
+        kbts_un GlyphId = ClassDef->StartGlyphId + GlyphIndex;
+        kbts_un GlyphClass = kbts__ReadU16Unaligned(&GlyphClasses[GlyphIndex]);
+
+        // Test the class, as the format 2 branch does. Testing GlyphId here let a
+        // class of 1024 or more index past the end of ClassesIncluded, and a glyph
+        // id the font does not have would index past the end of the matrix.
+        if((GlyphId < GlyphCount) &&
+           ((GlyphClass >= (ClassesIncludedLength * 64)) ||
+            (ClassesIncluded[GlyphClass / 64] & (1ull << (GlyphClass % 64)))))
         {
           kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(SubtableIndex, SubtableCount, GlyphId, GlyphCount);
           Matrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
@@ -27978,6 +28020,10 @@ static void kbts__MarkMatrixClassDef(kbts_u32 *Matrix, kbts_un SubtableIndex, kb
 
           KBTS__FOR(GlyphId, Range->StartGlyphId, OnePastLastGlyphId)
           {
+            if(++Budget->Ops > Budget->Max)
+            {
+              return;
+            }
             kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(SubtableIndex, SubtableCount, GlyphId, GlyphCount);
             Matrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
           }
@@ -28704,6 +28750,9 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
       kbts_un LookupCount = Header->LookupCount;
       kbts_un SubtableCount = Header->LookupSubtableCount;
 
+      kbts__bake_budget Budget = KBTS__ZERO;
+      Budget.Max = KBTS__MAX((kbts_un)State->FontDataSize * KBTS_BAKE_OPS_FACTOR, (kbts_un)KBTS_BAKE_OPS_MIN);
+
       kbts_u32 *GlyphLookupMatrix = kbts__PointerPushArray(&Bump, kbts_u32, State->GlyphLookupMatrixSizeInBytes / sizeof(kbts_u32));
       kbts_u32 *GlyphLookupSubtableMatrix = kbts__PointerPushArray(&Bump, kbts_u32, State->GlyphLookupSubtableMatrixSizeInBytes / sizeof(kbts_u32));
       kbts_u32 *LookupSubtableIndexOffsets = kbts__PointerPushArray(&Bump, kbts_u32, State->LookupCount);
@@ -28733,6 +28782,11 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
             kbts__lookup_list *LookupList = kbts__GetLookupList(ShapingTable);
             KBTS__FOR(LookupIndex, 0, LookupList->Count)
             {
+              if(Budget.Ops > Budget.Max)
+              {
+                Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                goto BakeDone;
+              }
               kbts__lookup *PackedLookup = kbts__GetLookup(LookupList, LookupIndex);
               kbts__unpacked_lookup Lookup = kbts__UnpackLookup(Gdef, PackedLookup);
 
@@ -28740,6 +28794,11 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
               KBTS__FOR(SubtableIndex, 0, Lookup.SubtableCount)
               {
+                if(Budget.Ops > Budget.Max)
+                {
+                  Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                  goto BakeDone;
+                }
                 kbts_u16 LookupType = Lookup.Type;
                 kbts_u16 *Base = KBTS__POINTER_OFFSET(kbts_u16, PackedLookup, kbts__ReadU16Unaligned(&Lookup.SubtableOffsets[SubtableIndex]));
 
@@ -28803,10 +28862,19 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                           kbts_u16 *SequenceGlyphIds = KBTS__POINTER_AFTER(kbts_u16, Rule);
                           KBTS__FOR(InputIndex, 1, Rule->GlyphCount)
                           {
+                            if(++Budget.Ops > Budget.Max)
+                            {
+                              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                              goto BakeDone;
+                            }
                             kbts_un GlyphId = kbts__ReadU16Unaligned(&SequenceGlyphIds[InputIndex - 1]);
 
-                            kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
-                            GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
+                            // A glyph id the font does not have would index past the end of the matrix.
+                            if(GlyphId < GlyphCount)
+                            {
+                              kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
+                              GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
+                            }
                           }
                         }
                       }
@@ -28832,6 +28900,11 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                           KBTS__FOR(SequenceIndex, 1, Rule->GlyphCount)
                           {
+                            if(++Budget.Ops > Budget.Max)
+                            {
+                              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                              goto BakeDone;
+                            }
                             kbts_un Class = kbts__ReadU16Unaligned(&SequenceClasses[SequenceIndex - 1]);
 
                             if(Class < (KBTS__ARRAY_LENGTH(ClassesIncluded) * 64))
@@ -28843,7 +28916,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                       }
                     }
 
-                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, ClassDefBase, ClassesIncluded, KBTS__ARRAY_LENGTH(ClassesIncluded));
+                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, ClassDefBase, ClassesIncluded, KBTS__ARRAY_LENGTH(ClassesIncluded), &Budget);
                   } break;
 
                   case 3:
@@ -28855,7 +28928,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                     {
                       kbts__coverage *SubstCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, CoverageOffsets[CoverageIndex]);
 
-                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubstCoverage, 1);
+                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubstCoverage, 1, &Budget);
                     }
 
                     Coverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, CoverageOffsets[0]);
@@ -28970,9 +29043,9 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                       }
                     }
 
-                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, BacktrackClassDefinition, BacktrackClassesIncluded, KBTS__ARRAY_LENGTH(BacktrackClassesIncluded));
-                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, InputClassDefinition, InputClassesIncluded, KBTS__ARRAY_LENGTH(InputClassesIncluded));
-                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, LookaheadClassDefinition, LookaheadClassesIncluded, KBTS__ARRAY_LENGTH(LookaheadClassesIncluded));
+                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, BacktrackClassDefinition, BacktrackClassesIncluded, KBTS__ARRAY_LENGTH(BacktrackClassesIncluded), &Budget);
+                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, InputClassDefinition, InputClassesIncluded, KBTS__ARRAY_LENGTH(InputClassesIncluded), &Budget);
+                    kbts__MarkMatrixClassDef(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, LookaheadClassDefinition, LookaheadClassesIncluded, KBTS__ARRAY_LENGTH(LookaheadClassesIncluded), &Budget);
                   } break;
 
                   case 3:
@@ -28985,20 +29058,20 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                     KBTS__FOR(BacktrackCoverageIndex, 0, Unpacked.BacktrackCount)
                     {
                       kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.BacktrackCoverageOffsets[BacktrackCoverageIndex]);
-                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1);
+                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                     }
 
                     KBTS__FOR(InputCoverageIndex, 1, Unpacked.InputCount)
                     {
                       kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.InputCoverageOffsets[InputCoverageIndex]);
-                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1);
+                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                     }
 
 
                     KBTS__FOR(LookaheadCoverageIndex, 0, Unpacked.LookaheadCount)
                     {
                       kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.LookaheadCoverageOffsets[LookaheadCoverageIndex]);
-                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1);
+                      kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                     }
                   } break;
                   }
@@ -29011,18 +29084,18 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                   KBTS__FOR(BacktrackIndex, 0, Unpacked.BacktrackCount)
                   {
                     kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.BacktrackCoverageOffsets[BacktrackIndex]);
-                    kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1);
+                    kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                   }
 
                   KBTS__FOR(LookaheadIndex, 0, Unpacked.LookaheadCount)
                   {
                     kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.LookaheadCoverageOffsets[LookaheadIndex]);
-                    kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1);
+                    kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                   }
                 }
 
-                kbts__MarkMatrixCoverage(GlyphLookupMatrix, RunningLookupIndex, LookupCount, GlyphCount, Coverage, 0);
-                kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, Coverage, 1);
+                kbts__MarkMatrixCoverage(GlyphLookupMatrix, RunningLookupIndex, LookupCount, GlyphCount, Coverage, 0, &Budget);
+                kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, Coverage, 1, &Budget);
 
                 RunningSubtableIndex += 1;
               }
@@ -29045,6 +29118,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
     }
   }
 
+BakeDone:
   if(Result != KBTS_LOAD_FONT_ERROR_NONE)
   {
     Font->Blob = 0;
