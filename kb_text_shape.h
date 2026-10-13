@@ -15964,7 +15964,7 @@ static kbts__chained_sequence_rule_set *kbts__GetChainedClassSequenceRuleSet(kbt
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Context + 1);
   kbts_u16 Offset = Offsets[Index];
-  kbts__chained_sequence_rule_set *Result = Offset ? KBTS__POINTER_OFFSET(kbts__chained_sequence_rule_set, Context, Offset) : NULL;
+  kbts__chained_sequence_rule_set *Result = Offset ? KBTS__POINTER_OFFSET(kbts__chained_sequence_rule_set, Context, Offset) : 0;
   return Result;
 }
 
