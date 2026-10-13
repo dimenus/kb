@@ -27619,7 +27619,11 @@ static kbts__cmap_subtable_pointer kbts__SelectCmapSubtableFromBlob(kbts_blob_he
 
 KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_state *State, void *FontData, int FontDataSize, int FontIndex, int *ScratchSize_, int *OutputSize_)
 {
-  kbts_load_font_error Result = 0;
+  // Every path that recognises the data sets its own result. Anything else, an
+  // unknown header, too little data, or a collection index out of range, is not
+  // a font, and must not come back as KBTS_LOAD_FONT_ERROR_NONE: kbts_FontIsValid
+  // would then accept a font with no blob, and the next call would dereference it.
+  kbts_load_font_error Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
 
   if(FontDataSize >= 4)
   {
@@ -27822,10 +27826,7 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
     {
       kbts_blob_header *Header = (kbts_blob_header *)FontData;
 
-      if(Header->Version != KBTS_BLOB_VERSION_CURRENT)
-      {
-        Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-      }
+      Result = (Header->Version == KBTS_BLOB_VERSION_CURRENT) ? KBTS_LOAD_FONT_ERROR_NONE : KBTS_LOAD_FONT_ERROR_INVALID_FONT;
 
       // @Incomplete: Bounds check or something.
 
@@ -27833,6 +27834,11 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
       kbts__cmap_subtable_pointer PreferredSubtable = kbts__SelectCmapSubtableFromBlob(Header, &Header->Tables[KBTS_BLOB_TABLE_ID_CMAP], &Font->Cmap14, 0);
       Font->Cmap = PreferredSubtable.Subtable;
     }
+  }
+
+  if(Result == KBTS_LOAD_FONT_ERROR_INVALID_FONT)
+  {
+    Font->Error = Result;
   }
 
   return Result;
