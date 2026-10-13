@@ -27537,6 +27537,7 @@ KBTS_EXPORT int kbts_FontCount(void *Data, int Size)
     }
     else if((Magic == KBTS_FOURCC('O', 'T', 'T', 'O')) ||
             (Magic == KBTS__U32BE(0x10000)) ||
+            (Magic == KBTS_FOURCC('t', 'r', 'u', 'e')) ||
             (Magic == KBTS_FOURCC('k', 'b', 't', 's')))
     {
       Result = 1;
@@ -27651,8 +27652,11 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
       }
     }
 
+    // 'true' is Apple's sfnt version tag for TrueType outlines. The table
+    // directory is the same as for 0x00010000.
     if((Magic == KBTS_FOURCC('O', 'T', 'T', 'O')) ||
-       (Magic == KBTS__U32BE(0x10000)))
+       (Magic == KBTS__U32BE(0x10000)) ||
+       (Magic == KBTS_FOURCC('t', 'r', 'u', 'e')))
     {
       Result = KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB;
 
