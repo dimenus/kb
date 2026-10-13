@@ -3095,6 +3095,7 @@ enum kbts_shape_error_enum
   KBTS_SHAPE_ERROR_INVALID_FONT,
   KBTS_SHAPE_ERROR_GAVE_TEXT_BEFORE_CALLING_BEGIN,
   KBTS_SHAPE_ERROR_OUT_OF_MEMORY,
+  KBTS_SHAPE_ERROR_TOO_MANY_OPERATIONS,
 
   KBTS_SHAPE_ERROR_COUNT,
 };
@@ -13785,6 +13786,10 @@ struct kbts_shape_scratchpad
   kbts_u32 SequentialLookupIndexIndex;
   kbts_u32 FeatureStagesRead;
 
+  // Set by kbts__ShapeDirectCapped for one shaping call. A limit of 0 means none.
+  kbts_un OperationCount;
+  kbts_un OperationLimit;
+
   kbts_shape_error Error;
 };
 
@@ -19009,6 +19014,13 @@ static kbts_b32 kbts__BucketGlyph(kbts_shape_scratchpad *Scratchpad, kbts_glyph 
 
 KBTS_INLINE void kbts__GsubMutate(kbts_shape_scratchpad *Scratchpad, kbts_font *Font, kbts_glyph *Glyph, kbts_un CurrentSequentialLookupIndex, kbts_u16 NewId, kbts_u32 Flags)
 {
+  // Every substitution is one operation. See kbts__ShapeDirectCapped.
+  if(Scratchpad->OperationLimit && (++Scratchpad->OperationCount > Scratchpad->OperationLimit))
+  {
+    Scratchpad->Error = KBTS_SHAPE_ERROR_TOO_MANY_OPERATIONS;
+    return;
+  }
+
   Glyph->Id = NewId;
   Glyph->Classes = kbts__GlyphClasses(Font, NewId);
   Glyph->Flags = (Glyph->Flags & ~KBTS_GLYPH_FLAG_FIRST_IN_MULTIPLE_SUBSTITUTION) | Flags;
@@ -22114,6 +22126,11 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
             KBTS__FOR(GlyphIndex_, 0, BlockGlyphCount)
             {
               kbts_un GlyphIndex = (LookupTypeIs8) ? (BlockGlyphCount - 1 - GlyphIndex_) : GlyphIndex_;
+              if(Scratchpad->Error)
+              {
+                return;
+              }
+
               kbts__bucketed_glyph *Bucketed = &Block->Glyphs[GlyphIndex];
 
               if(kbts__BucketedGlyphIsValid(Bucketed))
@@ -22137,6 +22154,11 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
                   
                   while(FrameCount)
                   {
+                    if(Scratchpad->Error)
+                    {
+                      return;
+                    }
+
                     // These flags are used by USE.
                     kbts_u32 GeneratedGlyphFlags = GlyphFilter & (KBTS_GLYPH_FLAG_RPHF | KBTS_GLYPH_FLAG_PREF);
                     kbts__DoSubstitution(Scratchpad, Config, Storage, LookupList, SequentialLookupIndex, FeatureValue, Frames, &FrameCount, 0, SkipFlags, GeneratedGlyphFlags);
@@ -27014,9 +27036,40 @@ KBTS_EXPORT void kbts_DestroyShapeScratchpad(kbts_shape_scratchpad *Scratchpad)
   }
 }
 
+// A font's substitutions can repeat without end: HarfBuzz's test font
+// TestGSUBThree.ttf takes "lol" through lookups that keep substituting, and kb
+// used to allocate until the process was killed. As in HarfBuzz
+// (HB_BUFFER_MAX_OPS_FACTOR, HB_BUFFER_MAX_OPS_MIN), one shaping call may do at
+// most KBTS_MAX_OPERATIONS_PER_INPUT_GLYPH substitutions per input glyph, and
+// never fewer than KBTS_MAX_OPERATIONS_MIN; past that it fails with
+// KBTS_SHAPE_ERROR_TOO_MANY_OPERATIONS. New glyphs from multiple substitution
+// also count, so this bounds the glyph count too.
+#ifndef KBTS_MAX_OPERATIONS_PER_INPUT_GLYPH
+#  define KBTS_MAX_OPERATIONS_PER_INPUT_GLYPH 4096
+#endif
+#ifndef KBTS_MAX_OPERATIONS_MIN
+#  define KBTS_MAX_OPERATIONS_MIN 65536
+#endif
+
+static void kbts__ShapeDirectCapped(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storage *Storage, kbts_direction RunDirection, kbts_s16 *VariationVectorNormalized)
+{
+  kbts_un InputGlyphCount = 0;
+  for(kbts_glyph *Glyph = Storage->GlyphSentinel.Next; kbts__GlyphIsValid(Storage, Glyph); Glyph = Glyph->Next)
+  {
+    InputGlyphCount += 1;
+  }
+
+  Scratchpad->OperationCount = 0;
+  Scratchpad->OperationLimit = KBTS__MAX(InputGlyphCount * KBTS_MAX_OPERATIONS_PER_INPUT_GLYPH, (kbts_un)KBTS_MAX_OPERATIONS_MIN);
+
+  kbts__ShapeDirect(Scratchpad, Storage, RunDirection, VariationVectorNormalized);
+
+  Scratchpad->OperationLimit = 0;
+}
+
 KBTS_EXPORT kbts_shape_error kbts_ShapeDirect2(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storage *Storage, kbts_direction RunDirection, kbts_s16 *VariationVectorNormalized, kbts_glyph_iterator *Output)
 {
-  kbts__ShapeDirect(Scratchpad, Storage, RunDirection, VariationVectorNormalized);
+  kbts__ShapeDirectCapped(Scratchpad, Storage, RunDirection, VariationVectorNormalized);
   kbts_shape_error Result = Scratchpad->Error;
 
   if(!Result)
@@ -27478,7 +27531,7 @@ static int kbts__ShapeRun(kbts_shape_context *Context, kbts_run *Run, int Versio
           kbts_NormalizeVariationVector(RunFontInfo->Font, RunFontInfo->VariationVector, RunFontInfo->VariationVectorNormalized);
         }
 
-        kbts__ShapeDirect(Scratchpad, &Context->GlyphStorage, RunDirection, RunFontInfo->VariationVectorNormalized);
+        kbts__ShapeDirectCapped(Scratchpad, &Context->GlyphStorage, RunDirection, RunFontInfo->VariationVectorNormalized);
 
         if(Scratchpad->Error)
         {
