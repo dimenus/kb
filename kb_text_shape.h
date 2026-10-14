@@ -14217,61 +14217,6 @@ KBTS_INLINE kbts_u32 kbts__ReadU32UnalignedEndOfBuffer(void *Data, kbts_un Left)
   return Result;
 }
 
-static void kbts__ByteSwapArray16Unchecked(kbts_u16 *Array, kbts_un Count)
-{
-  KBTS__FOR(It, 0, Count)
-  {
-    kbts_u16 X = kbts__ReadU16Unaligned(&Array[It]);
-    kbts__WriteU16Unaligned(&Array[It], kbts__ByteSwap16(X));
-  }
-}
-
-// Array + Count wraps around the address space when a font gives a huge count, and
-// the wrapped end then compares as inside the buffer (t-3213). Compare the count
-// with the room that is left instead.
-static int kbts__ByteSwapArray16(kbts_u16 *Array, kbts_un Count, char *End)
-{
-  int Result = 0;
-  if(((char *)Array <= End) && (Count <= (kbts_un)(End - (char *)Array) / sizeof(kbts_u16)))
-  {
-    kbts__ByteSwapArray16Unchecked(Array, Count);
-    Result = 1;
-  }
-
-  return Result;
-}
-
-static void kbts__ByteSwapArray32Unchecked(kbts_u32 *Array, kbts_un Count)
-{
-  // This is doing byte iteration to work with unaligned arrays.
-  char *At = (char *)Array;
-  KBTS__FOR(WordIndex, 0, Count)
-  {
-    char Byte0 = At[0];
-    char Byte1 = At[1];
-    char Byte2 = At[2];
-    char Byte3 = At[3];
-
-    At[0] = Byte3;
-    At[1] = Byte2;
-    At[2] = Byte1;
-    At[3] = Byte0;
-
-    At += sizeof(kbts_u32);
-  }
-}
-
-static int kbts__ByteSwapArray32(kbts_u32 *Array, kbts_un Count, char *End)
-{
-  int Result = 0;
-  if(((char *)Array <= End) && (Count <= (kbts_un)(End - (char *)Array) / sizeof(kbts_u32)))
-  {
-    kbts__ByteSwapArray32Unchecked(Array, Count);
-    Result = 1;
-  }
-  return Result;
-}
-
 // The way to turn an offset or a size read from a font into a pointer.
 // Returns Base + Offset when Base lies in [LimitBase, LimitEnd] and the Size bytes
 // at Base + Offset end at or before LimitEnd; returns 0 otherwise.
@@ -15885,28 +15830,29 @@ static kbts__class_sequence_rule *kbts__GetClassSequenceRule(kbts__class_sequenc
 {
   KBTS_ASSERT(Index < Set->Count);
   kbts_u16 *Offsets = (kbts_u16 *)(Set + 1);
-  kbts__class_sequence_rule *Result = KBTS__POINTER_OFFSET(kbts__class_sequence_rule, Set, Offsets[Index]);
+  kbts__class_sequence_rule *Result = KBTS__POINTER_OFFSET(kbts__class_sequence_rule, Set, kbts__ReadU16Unaligned(&Offsets[Index]));
   return Result;
 }
 
 static kbts__chained_sequence_rule_set *kbts__GetChainedSequenceRuleSet(kbts__chained_sequence_context_1 *Context, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Context + 1);
-  kbts__chained_sequence_rule_set *Result = Offsets[Index] ? KBTS__POINTER_OFFSET(kbts__chained_sequence_rule_set, Context, Offsets[Index]) : 0;
+  kbts_u16 Offset = kbts__ReadU16Unaligned(&Offsets[Index]);
+  kbts__chained_sequence_rule_set *Result = Offset ? KBTS__POINTER_OFFSET(kbts__chained_sequence_rule_set, Context, Offset) : 0;
   return Result;
 }
 
 static kbts__chained_sequence_rule *kbts__GetChainedSequenceRule(kbts__chained_sequence_rule_set *Set, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Set + 1);
-  kbts__chained_sequence_rule *Result = KBTS__POINTER_OFFSET(kbts__chained_sequence_rule, Set, Offsets[Index]);
+  kbts__chained_sequence_rule *Result = KBTS__POINTER_OFFSET(kbts__chained_sequence_rule, Set, kbts__ReadU16Unaligned(&Offsets[Index]));
   return Result;
 }
 
 static kbts__chained_sequence_rule_set *kbts__GetChainedClassSequenceRuleSet(kbts__chained_sequence_context_2 *Context, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Context + 1);
-  kbts_u16 Offset = Offsets[Index];
+  kbts_u16 Offset = kbts__ReadU16Unaligned(&Offsets[Index]);
   kbts__chained_sequence_rule_set *Result = Offset ? KBTS__POINTER_OFFSET(kbts__chained_sequence_rule_set, Context, Offset) : 0;
   return Result;
 }
@@ -15914,41 +15860,28 @@ static kbts__chained_sequence_rule_set *kbts__GetChainedClassSequenceRuleSet(kbt
 static kbts__chained_sequence_rule *kbts__GetChainedClassSequenceRule(kbts__chained_sequence_rule_set *Set, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Set + 1);
-  kbts__chained_sequence_rule *Result = KBTS__POINTER_OFFSET(kbts__chained_sequence_rule, Set, Offsets[Index]);
-  return Result;
-}
-
-static kbts__cmap_subtable_pointer kbts__GetCmapSubtable(kbts__cmap *Cmap, kbts_un Index)
-{
-  kbts__encoding_record *Records = (kbts__encoding_record *)(Cmap + 1);
-  kbts__encoding_record *Record = &Records[Index];
-
-  kbts__cmap_subtable_pointer Result;
-  Result.PlatformId = Record->PlatformId;
-  Result.EncodingId = Record->EncodingId;
-  Result.Subtable = KBTS__POINTER_OFFSET(kbts_u16, Cmap, Record->SubtableOffset);
-
+  kbts__chained_sequence_rule *Result = KBTS__POINTER_OFFSET(kbts__chained_sequence_rule, Set, kbts__ReadU16Unaligned(&Offsets[Index]));
   return Result;
 }
 
 static kbts__sequence *kbts__GetSequence(kbts__multiple_substitution *Subst, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Subst + 1);
-  kbts__sequence *Result = KBTS__POINTER_OFFSET(kbts__sequence, Subst, Offsets[Index]);
+  kbts__sequence *Result = KBTS__POINTER_OFFSET(kbts__sequence, Subst, kbts__ReadU16Unaligned(&Offsets[Index]));
   return Result;
 }
 
 static kbts__alternate_set *kbts__GetAlternateSet(kbts__alternate_substitution *Subst, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Subst + 1);
-  kbts__alternate_set *Result = KBTS__POINTER_OFFSET(kbts__alternate_set, Subst, Offsets[Index]);
+  kbts__alternate_set *Result = KBTS__POINTER_OFFSET(kbts__alternate_set, Subst, kbts__ReadU16Unaligned(&Offsets[Index]));
   return Result;
 }
 
 static kbts__ligature_set *kbts__GetLigatureSet(kbts__ligature_substitution *Subst, kbts_un Index)
 {
   kbts_u16 *Offsets = (kbts_u16 *)(Subst + 1);
-  kbts__ligature_set *Result = KBTS__POINTER_OFFSET(kbts__ligature_set, Subst, Offsets[Index]);
+  kbts__ligature_set *Result = KBTS__POINTER_OFFSET(kbts__ligature_set, Subst, kbts__ReadU16Unaligned(&Offsets[Index]));
   return Result;
 }
 
@@ -18255,28 +18188,6 @@ static void *kbts__BlobTableData(kbts_blob_header *Header, kbts_blob_table_id Ta
 }
 #define kbts__BlobTableDataType(Header, TableId, Type) (Type *)kbts__BlobTableData((Header), (TableId))
 
-static void *kbts__BlobTableHeaderChecked_(kbts_blob_header *Header, kbts_blob_table_id TableId, kbts_un HeaderSize, char **TableEnd, kbts_load_font_error *Error)
-{
-  void *Result = 0;
-  kbts_blob_table *Table = &Header->Tables[TableId];
-  kbts_un TableLength = Table->Length;
-
-  if(TableLength)
-  {
-    if(TableLength >= HeaderSize)
-    {
-      Result = KBTS__POINTER_OFFSET(void, Header, Table->OffsetFromStartOfFile);
-      *TableEnd = KBTS__POINTER_OFFSET(char, Result, TableLength);
-    }
-    else
-    {
-      *Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-    }
-  }
-
-  return Result;
-}
-#define kbts__BlobTableHeaderChecked(Header, TableId, HeaderType, TableEnd, Error) (HeaderType *)kbts__BlobTableHeaderChecked_((Header), (TableId), sizeof(HeaderType), (TableEnd), (Error))
 
 // Points the context at one table of the blob and clears its swap and visit state.
 // Returns the table, or 0 when it is absent. A table larger than the scratch memory
@@ -18304,15 +18215,40 @@ static void *kbts__BeginByteSwapTable(kbts__byteswap_context *Context, kbts_blob
   return Result;
 }
 
-// A check failed while byteswapping one table. That table is left half swapped, so it
-// is dropped: kb then shapes as if the font had no such table, which is a state it
-// already supports, and the rest of the font stays usable.
-static void kbts__DropTableOnByteSwapError(kbts_blob_header *Header, kbts__byteswap_context *Context, kbts_blob_table_id TableId)
+// Which tables are required: kb cannot map codepoints or measure glyphs without
+// them. head holds unitsPerEm, the scale of every advance; cmap is the only map from
+// codepoints to glyphs; maxp holds the glyph count that sizes the baked matrices; hhea
+// and hmtx hold the horizontal advances. A required table that is present and fails a
+// check rejects the font. A missing one keeps kb's fallback: no cmap maps every
+// codepoint to glyph 0, no maxp means no glyphs in the matrices, and no hhea or hmtx
+// gives every glyph unitsPerEm / 2 (or 1024 without head).
+// Every other table is optional (GSUB, GPOS, GDEF, the variation tables, OS/2, name,
+// vhea, vmtx): kb shapes without it. One that fails a check is dropped.
+static int kbts__BlobTableIsRequired(kbts_blob_table_id TableId)
+{
+  int Result = (TableId == KBTS_BLOB_TABLE_ID_HEAD) ||
+               (TableId == KBTS_BLOB_TABLE_ID_CMAP) ||
+               (TableId == KBTS_BLOB_TABLE_ID_MAXP) ||
+               (TableId == KBTS_BLOB_TABLE_ID_HHEA) ||
+               (TableId == KBTS_BLOB_TABLE_ID_HMTX);
+  return Result;
+}
+
+// Ends the swap of one table. A table that failed a check is left half swapped, so it
+// is dropped: kb then reads it as absent, a state every table supports. A required
+// table that failed also rejects the font. The error is cleared, because every
+// swap helper does nothing while it is set, and the next table must still be swapped.
+static void kbts__EndByteSwapTable(kbts_blob_header *Header, kbts__byteswap_context *Context, kbts_blob_table_id TableId, kbts_load_font_error *Result)
 {
   if(Context->Error)
   {
     Header->Tables[TableId].Length = 0;
     Context->Error = 0;
+
+    if(kbts__BlobTableIsRequired(TableId))
+    {
+      *Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+    }
   }
 }
 
@@ -22837,15 +22773,16 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
             {
               kbts_u16 *MapCount_ = KBTS__POINTER_AFTER(kbts_u16, AdvanceIndexMap);
 
-              MapCount = *MapCount_;
+              // The map can sit at an odd offset in HVAR.
+              MapCount = kbts__ReadU16Unaligned(MapCount_);
               Map = KBTS__POINTER_AFTER(char, MapCount_);
             } break;
 
             case 1:
             {
               kbts_u32 *MapCount_ = KBTS__POINTER_AFTER(kbts_u32, AdvanceIndexMap);
-              
-              MapCount = *MapCount_;
+
+              MapCount = kbts__ReadU32Unaligned(MapCount_);
               Map = KBTS__POINTER_AFTER(char, MapCount_);
             } break;
             }
@@ -28255,36 +28192,59 @@ KBTS_EXPORT int kbts_FontCount(void *Data, int Size)
   return Result;
 }
 
-static kbts__cmap_subtable_pointer kbts__SelectCmapSubtable(kbts__cmap *Cmap, char *TableEnd, kbts__cmap_14 **Cmap14, kbts_u16 *ResultFormat)
+// Picks the cmap subtable kb maps codepoints with, and the format 14 subtable.
+// The encoding records are already in native order. A record whose subtable header
+// does not fit in the table is skipped.
+// With a Context (kbts_PlaceBlob), each subtable's format is swapped through it, and
+// TableEnd is the context's. Without one (kbts_LoadTrustedBlob), the blob was swapped
+// when it was written, and a format that still looks big-endian is swapped here.
+static kbts__cmap_subtable_pointer kbts__SelectCmapSubtable(kbts__cmap *Cmap, char *TableEnd, kbts__byteswap_context *Context, kbts__cmap_14 **Cmap14, kbts_u16 *ResultFormat)
 {
   kbts__cmap_subtable_pointer Result = KBTS__ZERO;
+  kbts__encoding_record *Records = KBTS__POINTER_AFTER(kbts__encoding_record, Cmap);
 
   kbts_u16 PreferredFormat = 1;
   KBTS__FOR(It, 0, Cmap->TableCount)
   {
-    kbts__cmap_subtable_pointer Subtable = kbts__GetCmapSubtable(Cmap, It);
-    if((char *)(Subtable.Subtable + 1) <= TableEnd)
-    {
-      kbts_u16 Format = kbts__ReadU16Unaligned(Subtable.Subtable);
+    kbts__encoding_record *Record = &Records[It];
+    kbts__cmap_subtable_pointer Subtable = KBTS__ZERO;
+    Subtable.PlatformId = Record->PlatformId;
+    Subtable.EncodingId = Record->EncodingId;
+    Subtable.Subtable = (kbts_u16 *)kbts__CheckedOffset(Cmap, Record->SubtableOffset, sizeof(kbts_u16), (char *)Cmap, TableEnd);
 
-      // This is kind of iffy, but the statelessness is useful for selecting
-      // the cmap from an already-prepared blob without having to deal with
-      // the byteswap context.
-      if((Format > 0xFF) && 
-         ((Format >> 8) <= 14))
+    if(Subtable.Subtable)
+    {
+      kbts_u16 Format;
+
+      if(Context)
       {
-        Format = kbts__ByteSwap16(Format);
-        kbts__WriteU16Unaligned(Subtable.Subtable, Format);
+        if(!kbts__Swap16(Context, Subtable.Subtable, 1))
+        {
+          break;
+        }
+
+        Format = kbts__ReadU16Unaligned(Subtable.Subtable);
+      }
+      else
+      {
+        Format = kbts__ReadU16Unaligned(Subtable.Subtable);
+
+        // This is kind of iffy, but the statelessness is useful for selecting
+        // the cmap from an already-prepared blob without having to deal with
+        // the byteswap context.
+        if((Format > 0xFF) &&
+           ((Format >> 8) <= 14))
+        {
+          Format = kbts__ByteSwap16(Format);
+          kbts__WriteU16Unaligned(Subtable.Subtable, Format);
+        }
       }
 
       if(Format == 14)
       {
-        if((char *)(Subtable.Subtable + sizeof(kbts__cmap_14)) <= TableEnd)
+        if(Cmap14 && kbts__CheckedOffset(Subtable.Subtable, 0, sizeof(kbts__cmap_14), (char *)Cmap, TableEnd))
         {
-          if(Cmap14)
-          {
-            *Cmap14 = (kbts__cmap_14 *)Subtable.Subtable;
-          }
+          *Cmap14 = (kbts__cmap_14 *)Subtable.Subtable;
         }
       }
       else if(!Result.Subtable)
@@ -28320,7 +28280,155 @@ static kbts__cmap_subtable_pointer kbts__SelectCmapSubtableFromBlob(kbts_blob_he
     char *TableEnd = KBTS__POINTER_OFFSET(char, Header, CmapTable->OffsetFromStartOfFile + CmapTable->Length);
     kbts__cmap *Cmap = KBTS__POINTER_OFFSET(kbts__cmap, Header, CmapTable->OffsetFromStartOfFile);
 
-    Result = kbts__SelectCmapSubtable(Cmap, TableEnd, Cmap14, ResultFormat);
+    if(kbts__CheckedOffset(Cmap, sizeof(kbts__cmap), Cmap->TableCount * sizeof(kbts__encoding_record), (char *)Cmap, TableEnd))
+    {
+      Result = kbts__SelectCmapSubtable(Cmap, TableEnd, 0, Cmap14, ResultFormat);
+    }
+  }
+
+  return Result;
+}
+
+// Swaps the cmap subtable kb maps codepoints with, whose format is already swapped, and
+// checks every glyph id kbts_CodepointToGlyphId can read from it. A format kb cannot map
+// with breaks the table.
+static void kbts__ByteSwapCmapSubtable(kbts__byteswap_context *Context, kbts_u16 *Subtable)
+{
+  switch(kbts__ReadU16Unaligned(Subtable))
+  {
+  case 0:
+  {
+    kbts__cmap_0 *Cmap0 = (kbts__cmap_0 *)kbts__SwapOffset(Context, Subtable, 0, sizeof(kbts__cmap_0));
+
+    if(Cmap0)
+    {
+      kbts__Swap16(Context, &Cmap0->Length, 2);
+    }
+  }
+  break;
+
+  case 2:
+  {
+    kbts__cmap_2 *Cmap2 = (kbts__cmap_2 *)Subtable;
+
+    // Length, language, and the 256 sub-header keys.
+    if(kbts__Swap16(Context, &Cmap2->Length, 2 + 256))
+    {
+      // A key is a sub-header index times 8 (kbts_CodepointToGlyphId divides it).
+      kbts_un SubHeaderCount = 0;
+      KBTS__FOR(It, 0, 256)
+      {
+        kbts_un SubHeaderIndex = Cmap2->SubHeaderKeys[It] / 8;
+        SubHeaderCount = KBTS__MAX(SubHeaderCount, SubHeaderIndex + 1);
+      }
+
+      kbts__sub_header *SubHeaders = KBTS__POINTER_AFTER(kbts__sub_header, Cmap2);
+      if(kbts__Swap16(Context, SubHeaders, 4 * SubHeaderCount))
+      {
+        // Each sub-header's glyph ids start IdRangeOffset bytes after its own
+        // IdRangeOffset field, and EntryCount of them are read.
+        KBTS__FOR(It, 0, SubHeaderCount)
+        {
+          kbts__sub_header *SubHeader = &SubHeaders[It];
+          kbts_u16 *GlyphIds = (kbts_u16 *)kbts__SwapOffset(Context, &SubHeader->IdRangeOffset, SubHeader->IdRangeOffset, 0);
+
+          if(!GlyphIds || !kbts__Swap16(Context, GlyphIds, SubHeader->EntryCount))
+          {
+            break;
+          }
+        }
+      }
+    }
+  }
+  break;
+
+  case 4:
+  {
+    kbts__cmap_4 *Cmap4 = (kbts__cmap_4 *)Subtable;
+
+    // The end codes, the reserved pad, the start codes, the deltas and the range offsets.
+    if(kbts__Swap16(Context, &Cmap4->Length, 5) &&
+       kbts__Swap16(Context, KBTS__POINTER_AFTER(kbts_u16, Cmap4), (kbts_un)Cmap4->SegmentCountTimesTwo * 2 + 1))
+    {
+      kbts_un SegmentCount = Cmap4->SegmentCountTimesTwo / 2;
+      kbts_u16 *EndCodes = KBTS__POINTER_AFTER(kbts_u16, Cmap4);
+      kbts_u16 *StartCodes = EndCodes + SegmentCount + 1;
+      kbts_s16 *IdDeltas = (kbts_s16 *)(StartCodes + SegmentCount);
+      kbts_u16 *IdRangeOffsets = (kbts_u16 *)(IdDeltas + SegmentCount);
+
+      KBTS__FOR(SegmentIndex, 0, SegmentCount)
+      {
+        // The cmap subtable can start at an odd offset, so these arrays may be misaligned.
+        kbts_un Offset = kbts__ReadU16Unaligned(&IdRangeOffsets[SegmentIndex]);
+        kbts_un StartCode = kbts__ReadU16Unaligned(&StartCodes[SegmentIndex]);
+        kbts_un EndCode = kbts__ReadU16Unaligned(&EndCodes[SegmentIndex]);
+
+        if((StartCode == 0xFFFF) && (EndCode == 0xFFFF))
+        {
+          kbts__WriteU16Unaligned(&IdRangeOffsets[SegmentIndex], 0);
+
+          Offset = 0;
+        }
+
+        // A codepoint in [StartCode, EndCode] reads the glyph id at
+        // &IdRangeOffsets[SegmentIndex] + Offset / 2 + (Codepoint - StartCode).
+        // A segment whose end comes before its start matches no codepoint.
+        if(Offset && (EndCode >= StartCode) &&
+           !kbts__Swap16(Context, kbts__SwapOffset(Context, &IdRangeOffsets[SegmentIndex], (Offset / 2) * sizeof(kbts_u16), 0), EndCode - StartCode + 1))
+        {
+          break;
+        }
+      }
+    }
+  }
+  break;
+
+  case 6:
+  {
+    kbts__cmap_6 *Cmap6 = (kbts__cmap_6 *)Subtable;
+
+    if(kbts__Swap16(Context, &Cmap6->Length, 4))
+    {
+      kbts__Swap16(Context, KBTS__POINTER_AFTER(kbts_u16, Cmap6), Cmap6->EntryCount);
+    }
+  }
+  break;
+
+  case 12:
+  {
+    kbts__cmap_12_13 *Cmap12 = (kbts__cmap_12_13 *)Subtable;
+
+    // Three 32-bit values per group.
+    if(kbts__Swap32(Context, &Cmap12->Length, 3) &&
+       kbts__SwapArrayOffset(Context, Cmap12, sizeof(kbts__cmap_12_13), Cmap12->GroupCount, sizeof(kbts__sequential_map_group)))
+    {
+      kbts__Swap32(Context, KBTS__POINTER_AFTER(kbts_u32, Cmap12), (kbts_un)Cmap12->GroupCount * 3);
+    }
+  }
+  break;
+
+  default:
+  {
+    Context->Error = 1;
+  }
+  break;
+  }
+}
+
+// The maxp versions kb reads: 0.5 holds only the glyph count, and 1.0 holds 13 more
+// values. Returns the size of that version, or for any other version the largest
+// kbts_un, which no table holds.
+static kbts_un kbts__MaxpSize(kbts_u32 Version)
+{
+  kbts_un Result = (kbts_un)-1;
+
+  if(Version == 0x00005000)
+  {
+    Result = 6;
+  }
+  else if(Version == 0x00010000)
+  {
+    Result = sizeof(kbts__maxp);
   }
 
   return Result;
@@ -28344,9 +28452,10 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
   KBTS_MEMSET(Font->ShapingTables, 0, sizeof(Font->ShapingTables));
   Font->Error = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
 
-  if(FontDataSize >= 4)
+  if(FontData && (FontDataSize >= 4))
   {
-    char *FileEnd = (char *)FontData + FontDataSize;
+    char *FileBase = (char *)FontData;
+    char *FileEnd = FileBase + FontDataSize;
     // The caller's buffer need not be aligned: a font embedded in a file rarely is.
     kbts_u32 Magic = kbts__ReadU32Unaligned((kbts_u32 *)FontData);
     kbts_un DirectoryOffset = 0;
@@ -28355,15 +28464,14 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
     {
       Magic = 0;
 
-      if(FontDataSize >= (int)sizeof(kbts__ttc_header))
+      kbts__ttc_header *Header = (kbts__ttc_header *)kbts__CheckedOffset(FileBase, 0, sizeof(kbts__ttc_header), FileBase, FileEnd);
+      if(Header)
       {
-        kbts__ttc_header *Header = (kbts__ttc_header *)FontData;
-        kbts_un FontCount = kbts__ByteSwap32(Header->FontCount);
+        kbts_un FontCount = kbts__ByteSwap32(kbts__ReadU32Unaligned(&Header->FontCount));
+        kbts_u32 *TableDirectoryOffsets = (kbts_u32 *)kbts__CheckedOffset(Header, sizeof(kbts__ttc_header), kbts__ArraySize(FontCount, sizeof(kbts_u32)), FileBase, FileEnd);
 
-        if(((kbts_u32)FontIndex < FontCount) &&
-           ((kbts_un)FontDataSize >= (sizeof(kbts__ttc_header) + sizeof(kbts_u32) * FontCount)))
+        if(TableDirectoryOffsets && ((kbts_u32)FontIndex < FontCount))
         {
-          kbts_u32 *TableDirectoryOffsets = KBTS__POINTER_AFTER(kbts_u32, Header);
           DirectoryOffset = kbts__ByteSwap32(kbts__ReadU32Unaligned(&TableDirectoryOffsets[FontIndex]));
 
           Magic = KBTS__U32BE(0x10000);
@@ -28371,187 +28479,203 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
       }
     }
 
+    // A font without its table directory has nothing to load.
+    kbts__table_directory *Directory = (kbts__table_directory *)kbts__CheckedOffset(FileBase, DirectoryOffset, sizeof(kbts__table_directory), FileBase, FileEnd);
+
     // 'true' is Apple's sfnt version tag for TrueType outlines. The table
     // directory is the same as for 0x00010000.
-    if((Magic == KBTS_FOURCC('O', 'T', 'T', 'O')) ||
-       (Magic == KBTS__U32BE(0x10000)) ||
-       (Magic == KBTS_FOURCC('t', 'r', 'u', 'e')))
+    if(Directory &&
+       ((Magic == KBTS_FOURCC('O', 'T', 'T', 'O')) ||
+        (Magic == KBTS__U32BE(0x10000)) ||
+        (Magic == KBTS_FOURCC('t', 'r', 'u', 'e'))))
     {
       Result = KBTS_LOAD_FONT_ERROR_NEED_TO_CREATE_BLOB;
 
       State->FontData = FontData;
       State->FontDataSize = (kbts_u32)FontDataSize;
 
-      kbts__table_directory *Directory = KBTS__POINTER_OFFSET(kbts__table_directory, FontData, DirectoryOffset);
-      kbts_un DirectoryTableCount = kbts__ByteSwap16(Directory->TableCount);
+      kbts_un DirectoryTableCount = kbts__ByteSwap16(kbts__ReadU16Unaligned(&Directory->TableCount));
+      kbts__table_record *Tables = (kbts__table_record *)kbts__CheckedOffset(Directory, sizeof(kbts__table_directory), kbts__ArraySize(DirectoryTableCount, sizeof(kbts__table_record)), FileBase, FileEnd);
 
-      kbts__table_record *Tables = KBTS__POINTER_AFTER(kbts__table_record, Directory);
-
-      kbts_un DirectoryTableCapacity = (kbts_un)(FileEnd - (char *)Tables) / sizeof(kbts__table_record);
-      if(DirectoryTableCount <= DirectoryTableCapacity)
+      // A directory that claims more records than the file holds has no tables. Each
+      // record is read unaligned, because a collection can put a directory anywhere.
+      for(kbts_un TableIndex = 0; TableIndex < (Tables ? DirectoryTableCount : 0); ++TableIndex)
       {
-        for(kbts_un TableIndex = 0; TableIndex < DirectoryTableCount; ++TableIndex)
+        kbts__table_record *Table = &Tables[TableIndex];
+        kbts_u32 TableOffset = kbts__ByteSwap32(kbts__ReadU32Unaligned(&Table->Offset));
+        kbts_u32 TableLength = kbts__ByteSwap32(kbts__ReadU32Unaligned(&Table->Length));
+
+        // A table must lie inside the file, after the directory. A record that does not
+        // is skipped, and that table is absent.
+        char *TableBase = (char *)kbts__CheckedOffset(FileBase, TableOffset, TableLength, FileBase, FileEnd);
+        if(TableBase && (TableBase >= (char *)(Tables + DirectoryTableCount)))
         {
-          kbts__table_record *Table = &Tables[TableIndex];
-          kbts_u32 TableOffset = kbts__ByteSwap32(Table->Offset);
-          kbts_u32 TableLength = kbts__ByteSwap32(Table->Length);
+          kbts_blob_table_id TableId = 0;
 
-          void *TableBase = KBTS__POINTER_OFFSET(void, FontData, TableOffset);
-          char *TableEnd = (char *)TableBase + TableLength;
-          if(((char *)TableBase >= (char *)(Tables + DirectoryTableCount)) && (TableEnd <= FileEnd))
+          switch(kbts__ReadU32Unaligned(&Table->Tag))
           {
-            kbts_blob_table_id TableId = 0;
+          case KBTS_FOURCC('h', 'e', 'a', 'd'): TableId = KBTS_BLOB_TABLE_ID_HEAD; break;
+          case KBTS_FOURCC('c', 'm', 'a', 'p'): TableId = KBTS_BLOB_TABLE_ID_CMAP; break;
+          case KBTS_FOURCC('G', 'D', 'E', 'F'): TableId = KBTS_BLOB_TABLE_ID_GDEF; break;
+          case KBTS_FOURCC('G', 'S', 'U', 'B'): TableId = KBTS_BLOB_TABLE_ID_GSUB; break;
+          case KBTS_FOURCC('G', 'P', 'O', 'S'): TableId = KBTS_BLOB_TABLE_ID_GPOS; break;
+          case KBTS_FOURCC('h', 'h', 'e', 'a'): TableId = KBTS_BLOB_TABLE_ID_HHEA; break;
+          case KBTS_FOURCC('v', 'h', 'e', 'a'): TableId = KBTS_BLOB_TABLE_ID_VHEA; break;
+          case KBTS_FOURCC('h', 'm', 't', 'x'): TableId = KBTS_BLOB_TABLE_ID_HMTX; break;
+          case KBTS_FOURCC('v', 'm', 't', 'x'): TableId = KBTS_BLOB_TABLE_ID_VMTX; break;
+          case KBTS_FOURCC('m', 'a', 'x', 'p'): TableId = KBTS_BLOB_TABLE_ID_MAXP; break;
+          case KBTS_FOURCC('O', 'S', '/', '2'): TableId = KBTS_BLOB_TABLE_ID_OS2;  break;
+          case KBTS_FOURCC('n', 'a', 'm', 'e'): TableId = KBTS_BLOB_TABLE_ID_NAME; break;
+          case KBTS_FOURCC('f', 'v', 'a', 'r'): TableId = KBTS_BLOB_TABLE_ID_FVAR; break;
+          case KBTS_FOURCC('a', 'v', 'a', 'r'): TableId = KBTS_BLOB_TABLE_ID_AVAR; break;
+          case KBTS_FOURCC('M', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_MVAR; break;
+          case KBTS_FOURCC('H', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_HVAR; break;
+          case KBTS_FOURCC('V', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_VVAR; break;
+          }
 
-            switch(Table->Tag)
-            {
-            case KBTS_FOURCC('h', 'e', 'a', 'd'): TableId = KBTS_BLOB_TABLE_ID_HEAD; break;
-            case KBTS_FOURCC('c', 'm', 'a', 'p'): TableId = KBTS_BLOB_TABLE_ID_CMAP; break;
-            case KBTS_FOURCC('G', 'D', 'E', 'F'): TableId = KBTS_BLOB_TABLE_ID_GDEF; break;
-            case KBTS_FOURCC('G', 'S', 'U', 'B'): TableId = KBTS_BLOB_TABLE_ID_GSUB; break;
-            case KBTS_FOURCC('G', 'P', 'O', 'S'): TableId = KBTS_BLOB_TABLE_ID_GPOS; break;
-            case KBTS_FOURCC('h', 'h', 'e', 'a'): TableId = KBTS_BLOB_TABLE_ID_HHEA; break;
-            case KBTS_FOURCC('v', 'h', 'e', 'a'): TableId = KBTS_BLOB_TABLE_ID_VHEA; break;
-            case KBTS_FOURCC('h', 'm', 't', 'x'): TableId = KBTS_BLOB_TABLE_ID_HMTX; break;
-            case KBTS_FOURCC('v', 'm', 't', 'x'): TableId = KBTS_BLOB_TABLE_ID_VMTX; break;
-            case KBTS_FOURCC('m', 'a', 'x', 'p'): TableId = KBTS_BLOB_TABLE_ID_MAXP; break;
-            case KBTS_FOURCC('O', 'S', '/', '2'): TableId = KBTS_BLOB_TABLE_ID_OS2;  break;
-            case KBTS_FOURCC('n', 'a', 'm', 'e'): TableId = KBTS_BLOB_TABLE_ID_NAME; break;
-            case KBTS_FOURCC('f', 'v', 'a', 'r'): TableId = KBTS_BLOB_TABLE_ID_FVAR; break;
-            case KBTS_FOURCC('a', 'v', 'a', 'r'): TableId = KBTS_BLOB_TABLE_ID_AVAR; break;
-            case KBTS_FOURCC('M', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_MVAR; break;
-            case KBTS_FOURCC('H', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_HVAR; break;
-            case KBTS_FOURCC('V', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_VVAR; break;
-            }
-
-            if(TableId)
-            {
-              kbts_blob_table *ReadTable = &State->Tables[TableId];
-              ReadTable->OffsetFromStartOfFile = TableOffset;
-              ReadTable->Length = TableLength;
-            }
+          if(TableId)
+          {
+            kbts_blob_table *ReadTable = &State->Tables[TableId];
+            ReadTable->OffsetFromStartOfFile = TableOffset;
+            ReadTable->Length = TableLength;
           }
         }
       }
 
+      // Size the lookup and subtable counts that kbts_PlaceBlob bakes matrices for. The
+      // font is still big-endian here, and this walk reads only what it has checked
+      // against the table. A GSUB or GPOS whose lookup list does not fit is dropped
+      // here, before it is copied: it is optional, and kb shapes without it.
+      kbts_u64 TotalLookupCount = 0;
+      kbts_u64 TotalSubtableCount = 0;
       {
-        kbts_un TotalLookupCount = 0;
-        kbts_un TotalSubtableCount = 0;
-
         kbts_blob_table_id GsubGposTableIds[] = {KBTS_BLOB_TABLE_ID_GSUB, KBTS_BLOB_TABLE_ID_GPOS};
-        kbts_blob_table *GsubGposTables[] = {&State->Tables[KBTS_BLOB_TABLE_ID_GSUB], &State->Tables[KBTS_BLOB_TABLE_ID_GPOS]};
-        KBTS__FOR(GsubGposTableIndex, 0, KBTS__ARRAY_LENGTH(GsubGposTables))
+        KBTS__FOR(GsubGposTableIndex, 0, KBTS__ARRAY_LENGTH(GsubGposTableIds))
         {
-          kbts_blob_table *Table = GsubGposTables[GsubGposTableIndex];
+          kbts_blob_table *Table = &State->Tables[GsubGposTableIds[GsubGposTableIndex]];
 
           if(Table->Length)
           {
-            kbts__gsub_gpos *GsubGpos = KBTS__POINTER_OFFSET(kbts__gsub_gpos, FontData, Table->OffsetFromStartOfFile);
-            kbts_u16 ScriptListOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&GsubGpos->ScriptListOffset));
-            kbts_u16 FeatureListOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&GsubGpos->FeatureListOffset));
-            kbts_u16 LookupListOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&GsubGpos->LookupListOffset));
+            char *TableBase = FileBase + Table->OffsetFromStartOfFile;
+            char *TableEnd = TableBase + Table->Length;
+            kbts__gsub_gpos *GsubGpos = (kbts__gsub_gpos *)kbts__CheckedOffset(TableBase, 0, 5 * sizeof(kbts_u16), TableBase, TableEnd);
+            int Keep = 0;
 
-            if(!ScriptListOffset &&
-               !FeatureListOffset &&
-               !LookupListOffset)
+            if(GsubGpos)
             {
-              // Apparently, this is a valid way of specifying an empty table.
-              kbts_blob_table_id TableId = GsubGposTableIds[GsubGposTableIndex];
+              kbts_un ScriptListOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&GsubGpos->ScriptListOffset));
+              kbts_un FeatureListOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&GsubGpos->FeatureListOffset));
+              kbts_un LookupListOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&GsubGpos->LookupListOffset));
 
-              KBTS__ZERO_TYPE(&State->Tables[TableId]);
-            }
-            else if(((ScriptListOffset + sizeof(kbts__script_list)) > Table->Length) ||
-                    ((FeatureListOffset + sizeof(kbts__feature_list)) > Table->Length) ||
-                    ((LookupListOffset + sizeof(kbts__lookup_list)) > Table->Length))
-            {
-              return KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-            }
-            else
-            {
-              kbts__lookup_list *LookupList = KBTS__POINTER_OFFSET(kbts__lookup_list, GsubGpos, kbts__ByteSwap16(GsubGpos->LookupListOffset));
-              kbts_u16 *LookupOffsets = KBTS__POINTER_AFTER(kbts_u16, LookupList);
-              kbts_un LookupCount = kbts__ByteSwap16(LookupList->Count);
+              // All three offsets 0 is a valid way of writing an empty table; it is
+              // dropped like a broken one.
+              kbts_u16 *LookupList = (kbts_u16 *)kbts__CheckedOffset(TableBase, LookupListOffset, sizeof(kbts_u16), TableBase, TableEnd);
 
-              KBTS__FOR(LookupIndex, 0, LookupCount)
+              if(ScriptListOffset && FeatureListOffset && LookupListOffset && LookupList)
               {
-                kbts__lookup *Lookup = KBTS__POINTER_OFFSET(kbts__lookup, LookupList, kbts__ByteSwap16(kbts__ReadU16Unaligned(&LookupOffsets[LookupIndex])));
+                kbts_un LookupCount = kbts__ByteSwap16(kbts__ReadU16Unaligned(LookupList));
+                kbts_u16 *LookupOffsets = (kbts_u16 *)kbts__CheckedOffset(LookupList, sizeof(kbts_u16), LookupCount * sizeof(kbts_u16), TableBase, TableEnd);
+                kbts_u64 SubtableCount = 0;
 
-                TotalSubtableCount += kbts__ByteSwap16(Lookup->SubtableCount);
+                Keep = (LookupOffsets != 0);
+
+                KBTS__FOR(LookupIndex, 0, Keep ? LookupCount : 0)
+                {
+                  kbts_un LookupOffset = kbts__ByteSwap16(kbts__ReadU16Unaligned(&LookupOffsets[LookupIndex]));
+                  kbts__lookup *Lookup = (kbts__lookup *)kbts__CheckedOffset(LookupList, LookupOffset, sizeof(kbts__lookup), TableBase, TableEnd);
+                  kbts_un LookupSubtableCount = Lookup ? kbts__ByteSwap16(kbts__ReadU16Unaligned(&Lookup->SubtableCount)) : 0;
+
+                  // The subtable offsets must fit too: the byte swap would reject them.
+                  if(!Lookup || !kbts__CheckedOffset(Lookup, sizeof(kbts__lookup), LookupSubtableCount * sizeof(kbts_u16), TableBase, TableEnd))
+                  {
+                    Keep = 0;
+                  }
+
+                  SubtableCount += LookupSubtableCount;
+                }
+
+                if(Keep)
+                {
+                  TotalLookupCount += LookupCount;
+                  TotalSubtableCount += SubtableCount;
+                }
               }
+            }
 
-              TotalLookupCount += LookupCount;
+            if(!Keep)
+            {
+              KBTS__ZERO_TYPE(Table);
             }
           }
         }
+      }
+
+      // maxp's glyph count sizes the matrices. Only a maxp that kbts_PlaceBlob accepts
+      // gives one; it rejects any other, and a missing maxp means 0 glyphs, as before.
+      kbts_un GlyphCount = 0;
+      {
+        kbts_blob_table *MaxpTable = &State->Tables[KBTS_BLOB_TABLE_ID_MAXP];
+        char *TableBase = FileBase + MaxpTable->OffsetFromStartOfFile;
+        char *TableEnd = TableBase + MaxpTable->Length;
+        kbts_u32 *Version = (kbts_u32 *)kbts__CheckedOffset(TableBase, 0, sizeof(kbts_u32), TableBase, TableEnd);
+        kbts__maxp *Maxp = 0;
+
+        if(Version)
+        {
+          Maxp = (kbts__maxp *)kbts__CheckedOffset(TableBase, 0, kbts__MaxpSize(kbts__ByteSwap32(kbts__ReadU32Unaligned(Version))), TableBase, TableEnd);
+        }
+
+        if(Maxp)
+        {
+          GlyphCount = kbts__ByteSwap16(kbts__ReadU16Unaligned(&Maxp->GlyphCount));
+        }
+      }
+
+      // kbts_PlaceBlob swaps every table through kbts__byteswap_context, one at a time,
+      // with two bytes of state per byte of the table, so it needs room for the largest.
+      kbts_u64 ScratchSize = 0;
+      KBTS__FOR(TableId, 0, KBTS_BLOB_TABLE_ID_COUNT)
+      {
+        ScratchSize = KBTS__MAX(ScratchSize, (kbts_u64)State->Tables[TableId].Length * 2);
+      }
+
+      // The matrices have one bit per glyph and lookup, and per glyph and subtable. Their
+      // bit index is computed in kbts_un (kbts__GlyphLookupSubtableMatrixIndex), so it
+      // must fit in one, also on 32-bit targets.
+      kbts_u64 GlyphLookupMatrixBits = TotalLookupCount * GlyphCount;
+      kbts_u64 GlyphLookupSubtableMatrixBits = TotalSubtableCount * GlyphCount;
+      kbts_u64 GlyphLookupMatrixSizeInWords = GlyphLookupMatrixBits ? (GlyphLookupMatrixBits + 31) / 32 : 0;
+      kbts_u64 GlyphLookupSubtableMatrixSizeInWords = GlyphLookupSubtableMatrixBits ? (GlyphLookupSubtableMatrixBits + 31) / 32 : 0;
+
+      // The same pushes kbts_PlaceBlob makes, in 64 bits, plus the alignment of each.
+      kbts_u64 OutputSize = sizeof(kbts_blob_header) + KBTS_ALIGNOF(kbts_blob_header);
+      KBTS__FOR(TableId, 0, KBTS_BLOB_TABLE_ID_COUNT)
+      {
+        OutputSize += (kbts_u64)State->Tables[TableId].Length + 4;
+      }
+      OutputSize += (GlyphLookupMatrixSizeInWords + GlyphLookupSubtableMatrixSizeInWords + TotalLookupCount) * sizeof(kbts_u32) + 3 * KBTS_ALIGNOF(kbts_u32);
+
+      // The sizes are returned as int and kept as kbts_u32. A font that needs more is
+      // not one kb can hold: tables that overlap in the file, or counts no real font has.
+      if((ScratchSize > 0x7FFFFFFF) || (OutputSize > 0x7FFFFFFF) ||
+         (GlyphLookupMatrixBits > (kbts_u64)(kbts_un)-1) ||
+         (GlyphLookupSubtableMatrixBits > (kbts_u64)(kbts_un)-1))
+      {
+        Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+      }
+      else
+      {
+        *ScratchSize_ = (int)ScratchSize;
+        *OutputSize_ = (int)OutputSize;
 
         State->LookupCount = (kbts_u32)TotalLookupCount;
         State->LookupSubtableCount = (kbts_u32)TotalSubtableCount;
-      }
-
-      {
-        kbts_un GlyphCount = 0;
-
-        kbts_blob_table *MaxpTable = &State->Tables[KBTS_BLOB_TABLE_ID_MAXP];
-        if(MaxpTable->Length)
-        {
-          kbts__maxp *Maxp = KBTS__POINTER_OFFSET(kbts__maxp, FontData, MaxpTable->OffsetFromStartOfFile);
-
-          GlyphCount = kbts__ByteSwap16(Maxp->GlyphCount);
-        }
-
         State->GlyphCount = (kbts_u32)GlyphCount;
+        State->ScratchSize = (kbts_u32)ScratchSize;
+        State->GlyphLookupMatrixSizeInBytes = (kbts_u32)(GlyphLookupMatrixSizeInWords * sizeof(kbts_u32));
+        State->GlyphLookupSubtableMatrixSizeInBytes = (kbts_u32)(GlyphLookupSubtableMatrixSizeInWords * sizeof(kbts_u32));
+        State->TotalSize = (kbts_u32)OutputSize;
       }
-
-      // kbts_PlaceBlob swaps these tables one at a time, with two bytes of state per byte
-      // of the table (kbts__byteswap_context), so it needs room for the largest one.
-      kbts_un ScratchSize = 0;
-      {
-        kbts_blob_table_id ByteSwapContextTableIds[] = {KBTS_BLOB_TABLE_ID_HVAR, KBTS_BLOB_TABLE_ID_VVAR, KBTS_BLOB_TABLE_ID_MVAR,
-                                                        KBTS_BLOB_TABLE_ID_GDEF, KBTS_BLOB_TABLE_ID_GSUB, KBTS_BLOB_TABLE_ID_GPOS};
-        KBTS__FOR(TableIdIndex, 0, KBTS__ARRAY_LENGTH(ByteSwapContextTableIds))
-        {
-          ScratchSize = KBTS__MAX(ScratchSize, (kbts_un)State->Tables[ByteSwapContextTableIds[TableIdIndex]].Length * 2);
-        }
-      }
-
-      kbts_un GlyphLookupMatrixSizeInWords = 0;
-      if(State->LookupCount &&
-         State->GlyphCount)
-      {
-        kbts__matrix_index LastIndex = kbts__GlyphLookupMatrixIndex(State->LookupCount - 1, State->GlyphCount - 1, State->GlyphCount);
-        GlyphLookupMatrixSizeInWords = LastIndex.WordIndex + 1;
-      }
-
-      kbts_un GlyphLookupSubtableMatrixSizeInWords = 0;
-      if(State->LookupSubtableCount &&
-         State->GlyphCount)
-      {
-        kbts__matrix_index LastIndex = kbts__GlyphLookupSubtableMatrixIndex(State->LookupSubtableCount - 1, State->LookupSubtableCount, State->GlyphCount - 1, State->GlyphCount);
-        GlyphLookupSubtableMatrixSizeInWords = LastIndex.WordIndex + 1;
-      }
-
-      kbts__pointer_bump_allocator Bump = kbts__PointerBumpAllocator(0);
-
-      kbts__PointerPushType(&Bump, kbts_blob_header);
-
-      KBTS__FOR(TableId, 0, KBTS_BLOB_TABLE_ID_COUNT)
-      {
-        kbts__PointerPush(&Bump, State->Tables[TableId].Length, 4);
-      }
-
-      kbts__PointerPushArray(&Bump, kbts_u32, GlyphLookupMatrixSizeInWords);
-      kbts__PointerPushArray(&Bump, kbts_u32, GlyphLookupSubtableMatrixSizeInWords);
-      kbts__PointerPushArray(&Bump, kbts_u32, State->LookupCount);
-
-      // Add the align just to make sure we can accept any pointer.
-      kbts_un OutputSize = Bump.At + KBTS_ALIGNOF(kbts_blob_header);
-
-      *ScratchSize_ = (int)ScratchSize;
-      *OutputSize_ = (int)OutputSize;
-
-      State->ScratchSize = (kbts_u32)ScratchSize;
-      State->GlyphLookupMatrixSizeInBytes = (kbts_u32)(GlyphLookupMatrixSizeInWords * sizeof(kbts_u32));
-      State->GlyphLookupSubtableMatrixSizeInBytes = (kbts_u32)(GlyphLookupSubtableMatrixSizeInWords * sizeof(kbts_u32));
-      State->TotalSize = (kbts_u32)OutputSize;
     }
     // A kbts blob is not a font: kb does not check it, so it is accepted only through
     // kbts_LoadTrustedBlob, from a caller that wrote it.
@@ -28799,434 +28923,278 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
       KBTS_MEMCPY(TableBase, InData, InTable.Length);
     }
 
-    // Byteswap it.
-
-    {
-      char *TableEnd;
-      kbts__head *Head = kbts__BlobTableHeaderChecked(Header, KBTS_BLOB_TABLE_ID_HEAD, kbts__head, &TableEnd, &Result);
-      if(Head)
-      {
-        kbts__ByteSwapArray16Unchecked(&Head->Major, 2);
-        kbts__ByteSwapArray32Unchecked(&Head->Revision, 2);
-        // We do not swap the magic number.
-        kbts__ByteSwapArray16Unchecked(&Head->Flags, 2);
-        // We do not swap file times.
-        kbts__ByteSwapArray16Unchecked((kbts_u16 *)&Head->XMin, 9);
-      }
-    }
-
-    Font->Blob = Header;
-
-    {
-      char *TableEnd;
-      kbts__cmap *Cmap = kbts__BlobTableHeaderChecked(Header, KBTS_BLOB_TABLE_ID_CMAP, kbts__cmap, &TableEnd, &Result);
-      if(Cmap)
-      {
-        int TableValid = 0;
-        Cmap->Version = kbts__ByteSwap16(Cmap->Version);
-        Cmap->TableCount = kbts__ByteSwap16(Cmap->TableCount);
-
-        kbts__encoding_record *Records = KBTS__POINTER_AFTER(kbts__encoding_record, Cmap);
-
-        if((char *)(Records + Cmap->TableCount) <= TableEnd)
-        {
-          KBTS__FOR(It, 0, Cmap->TableCount)
-          {
-            kbts__encoding_record *Record = &Records[It];
-            Record->EncodingId = kbts__ByteSwap16(Record->EncodingId);
-            Record->PlatformId = kbts__ByteSwap16(Record->PlatformId);
-            Record->SubtableOffset = kbts__ByteSwap32(Record->SubtableOffset);
-          }
-
-          kbts_u16 PreferredFormat = 1;
-
-          kbts__cmap_subtable_pointer PreferredSubtable = kbts__SelectCmapSubtable(Cmap, TableEnd, &Font->Cmap14, &PreferredFormat);
-          if(PreferredSubtable.Subtable)
-          {
-            kbts_u16 SubtableFormat = kbts__ReadU16Unaligned(PreferredSubtable.Subtable);
-            switch(SubtableFormat)
-            {
-            case 0:
-            {
-              kbts__cmap_0 *Cmap0 = (kbts__cmap_0 *)PreferredSubtable.Subtable;
-              if((char *)(Cmap0 + 1) <= TableEnd)
-              {
-                Cmap0->Length = kbts__ByteSwap16(Cmap0->Length);
-                Cmap0->Language = kbts__ByteSwap16(Cmap0->Language);
-                TableValid = 1;
-              }
-            }
-            break;
-
-            case 2:
-            {
-              kbts__cmap_2 *Cmap2 = (kbts__cmap_2 *)PreferredSubtable.Subtable;
-              if(kbts__ByteSwapArray16(&Cmap2->Length, 258, TableEnd))
-              {
-                kbts_un SubHeaderCount = 0;
-                KBTS__FOR(It, 0, 256)
-                {
-                  kbts_un SubHeaderIndex = Cmap2->SubHeaderKeys[It];
-                  SubHeaderCount = KBTS__MAX(SubHeaderCount, SubHeaderIndex + 1);
-                }
-
-                kbts__sub_header *SubHeaders = KBTS__POINTER_AFTER(kbts__sub_header, Cmap2);
-                if(kbts__ByteSwapArray16(&SubHeaders->FirstCode, 4 * SubHeaderCount, TableEnd))
-                {
-                  kbts_u16 *GlyphIds = (kbts_u16 *)(SubHeaders + SubHeaderCount);
-
-                  kbts_sn GlyphIdCount = 0;
-                  KBTS__FOR(It, 0, SubHeaderCount)
-                  {
-                    kbts__sub_header *SubHeader = &SubHeaders[It];
-
-                    kbts_u16 *OnePastLastGlyphId = &SubHeader->IdRangeOffset + SubHeader->IdRangeOffset / 2 + SubHeader->EntryCount;
-                    GlyphIdCount = KBTS__MAX(GlyphIdCount, OnePastLastGlyphId - GlyphIds);
-                  }
-
-                  if(kbts__ByteSwapArray16(GlyphIds, (kbts_un)GlyphIdCount, TableEnd))
-                  {
-                    TableValid = 1;
-                  }
-                }
-              }
-            }
-            break;
-
-            case 4:
-            {
-              kbts__cmap_4 *Cmap4 = (kbts__cmap_4 *)PreferredSubtable.Subtable;
-              if(kbts__ByteSwapArray16(&Cmap4->Length, 5, TableEnd) &&
-                 kbts__ByteSwapArray16(KBTS__POINTER_AFTER(kbts_u16, Cmap4), Cmap4->SegmentCountTimesTwo * 2 + 1, TableEnd))
-              {
-                kbts_un SegmentCount = Cmap4->SegmentCountTimesTwo / 2;
-                kbts_u16 *EndCodes = KBTS__POINTER_AFTER(kbts_u16, Cmap4);
-                kbts_u16 *StartCodes = EndCodes + SegmentCount + 1;
-                kbts_s16 *IdDeltas = (kbts_s16 *)(StartCodes + SegmentCount);
-                kbts_u16 *IdRangeOffsets = (kbts_u16 *)(IdDeltas + SegmentCount);
-                kbts_u16 *GlyphIds = IdRangeOffsets + SegmentCount;
-
-                kbts_sn GlyphIdCount = 0;
-
-                KBTS__FOR(SegmentIndex, 0, SegmentCount)
-                {
-                  // The cmap subtable can start at an odd offset, so these arrays may be misaligned.
-                  kbts_u16 Offset = kbts__ReadU16Unaligned(&IdRangeOffsets[SegmentIndex]);
-                  kbts_u16 StartCode = kbts__ReadU16Unaligned(&StartCodes[SegmentIndex]);
-                  kbts_u16 EndCode = kbts__ReadU16Unaligned(&EndCodes[SegmentIndex]);
-
-                  if((StartCode == 0xFFFF) && (EndCode == 0xFFFF))
-                  {
-                    kbts__WriteU16Unaligned(&IdRangeOffsets[SegmentIndex], 0);
-
-                    Offset = 0;
-                  }
-
-                  if(Offset)
-                  {
-                    kbts_u16 *OnePastIdLookup = &IdRangeOffsets[SegmentIndex] + (EndCode - StartCode + 1) + Offset / 2;
-
-                    GlyphIdCount = KBTS__MAX(GlyphIdCount, (kbts_sn)(OnePastIdLookup - GlyphIds));
-                  }
-                }
-
-                if(kbts__ByteSwapArray16(GlyphIds, (kbts_un)GlyphIdCount, TableEnd))
-                {
-                  TableValid = 1;
-                }
-              }
-            }
-            break;
-
-            case 6:
-            {
-              kbts__cmap_6 *Cmap6 = (kbts__cmap_6 *)PreferredSubtable.Subtable;
-              if(kbts__ByteSwapArray16(&Cmap6->Length, 4, TableEnd) &&
-                 kbts__ByteSwapArray16(KBTS__POINTER_AFTER(kbts_u16, Cmap6), Cmap6->EntryCount, TableEnd))
-              {
-                TableValid = 1;
-              }
-            }
-            break;
-
-            case 12:
-            {
-              kbts__cmap_12_13 *Cmap12 = (kbts__cmap_12_13 *)PreferredSubtable.Subtable;
-              if(kbts__ByteSwapArray32(&Cmap12->Length, 3, TableEnd) &&
-                 kbts__ByteSwapArray32(KBTS__POINTER_AFTER(kbts_u32, Cmap12), Cmap12->GroupCount * 3, TableEnd))
-              {
-                TableValid = 1;
-              }
-            }
-            break;
-            }
-
-            Font->Cmap = PreferredSubtable.Subtable;
-          }
-        }
-
-        if(!TableValid)
-        {
-          Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-        }
-      }
-    }
-
-    {
-      kbts_blob_table_id HeaTableIds[2] = {KBTS_BLOB_TABLE_ID_HHEA, KBTS_BLOB_TABLE_ID_VHEA};
-      KBTS__FOR(HeaTableIndex, 0, KBTS__ARRAY_LENGTH(HeaTableIds))
-      {
-        kbts_blob_table *HeaTable = &Header->Tables[HeaTableIds[HeaTableIndex]];
-
-        if(HeaTable->Length)
-        {
-          kbts__hea *Hea = KBTS__POINTER_OFFSET(kbts__hea, Header, HeaTable->OffsetFromStartOfFile);
-          char *TableEnd = KBTS__POINTER_OFFSET(char, Header, HeaTable->OffsetFromStartOfFile + HeaTable->Length);
-
-          if(!kbts__ByteSwapArray16((kbts_u16 *)Hea, sizeof(kbts__hea) / sizeof(kbts_u16), TableEnd))
-          {
-            Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-          }
-        }
-      }
-    }
-
-    {
-      kbts_blob_table_id MtxTableIds[2] = {KBTS_BLOB_TABLE_ID_HMTX, KBTS_BLOB_TABLE_ID_VMTX};
-
-      KBTS__FOR(MtxTableIndex, 0, KBTS__ARRAY_LENGTH(MtxTableIds))
-      {
-        kbts_blob_table *MtxTable = &Header->Tables[MtxTableIds[MtxTableIndex]];
-
-        if(MtxTable->Length)
-        {
-          kbts_u16 *Mtx = KBTS__POINTER_OFFSET(kbts_u16, Header, MtxTable->OffsetFromStartOfFile);
-          kbts__ByteSwapArray16Unchecked(Mtx, MtxTable->Length / sizeof(kbts_u16));
-        }
-      }
-    }
-
-    {
-      kbts_blob_table *MaxpTable = &Header->Tables[KBTS_BLOB_TABLE_ID_MAXP];
-
-      if(MaxpTable->Length)
-      {
-        if(MaxpTable->Length >= 6)
-        {
-          kbts__maxp *Maxp = KBTS__POINTER_OFFSET(kbts__maxp, Header, MaxpTable->OffsetFromStartOfFile);
-          char *TableEnd = KBTS__POINTER_OFFSET(char, Header, MaxpTable->OffsetFromStartOfFile + MaxpTable->Length);
-
-          Maxp->Major = kbts__ByteSwap16(Maxp->Major);
-          Maxp->Minor = kbts__ByteSwap16(Maxp->Minor);
-
-          kbts_un U16Count = 0;
-          if(!Maxp->Major && (Maxp->Minor == 0x5000))
-          {
-            U16Count = 1;
-          }
-          else if((Maxp->Major == 1) && !Maxp->Minor)
-          {
-            U16Count = 14;
-          }
-
-          if(kbts__ByteSwapArray16(&Maxp->GlyphCount, U16Count, TableEnd))
-          {
-            Header->GlyphCount = Maxp->GlyphCount;
-          }
-          else
-          {
-            Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-          }
-        }
-        else
-        {
-          Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-        }
-      }
-    }
-
-    {
-      kbts_blob_table *Os2Table = &Header->Tables[KBTS_BLOB_TABLE_ID_OS2];
-
-      if(Os2Table->Length)
-      {
-        kbts__os2 *Os2 = KBTS__POINTER_OFFSET(kbts__os2, Header, Os2Table->OffsetFromStartOfFile);
-        kbts_un Length = Os2Table->Length;
-
-        if(Length >= 68)
-        {
-          kbts__ByteSwapArray16Unchecked(&Os2->Version, 16);
-          kbts__ByteSwapArray32Unchecked(Os2->UnicodeRange, 4);
-          kbts__ByteSwapArray16Unchecked(&Os2->Selection, 3);
-
-          kbts_un Version = Os2->Version;
-
-          if(Length >= 78)
-          {
-            kbts__ByteSwapArray16Unchecked((kbts_u16 *)&Os2->TypoAscender, 5);
-
-            if(Version >= 1)
-            {
-              if(Length >= 86)
-              {
-                kbts__ByteSwapArray32Unchecked(Os2->CodePageRange, 2);
-
-                if(Version >= 2)
-                {
-                  if(Length >= 96)
-                  {
-                    kbts__ByteSwapArray16Unchecked((kbts_u16 *)&Os2->Height, 5);
-
-                    if(Version >= 5)
-                    {
-                      if(Length >= 100)
-                      {
-                        kbts__ByteSwapArray16Unchecked(&Os2->LowerOpticalPointSize, 2);
-                      }
-                      else
-                      {
-                        Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-                      }
-                    }
-                  }
-                  else
-                  {
-                    Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-                  }
-                }
-              }
-              else
-              {
-                Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-              }
-            }
-          }
-        }
-        else
-        {
-          Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-        }
-      }
-      // We should normally set Result to INVALID_FONT if there is no OS/2 table.
-      // However, one Harfbuzz test has a font with no OS/2 table.
-    }
-
-    {
-      char *TableEnd;
-      kbts__name *Name = kbts__BlobTableHeaderChecked(Header, KBTS_BLOB_TABLE_ID_NAME, kbts__name, &TableEnd, &Result);  
-      if(Name)
-      {
-        kbts__ByteSwapArray16Unchecked(&Name->Version, 3);
-
-        kbts__name_record *NameRecords = KBTS__POINTER_AFTER(kbts__name_record, Name);
-
-        kbts_un U16Count = Name->Count * 6;
-        if(!kbts__ByteSwapArray16(&NameRecords->PlatformId, U16Count, TableEnd))
-        {
-          Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
-        }
-      }
-
-      // We should normally set Result to INVALID_FONT if there is no name table.
-      // However, one Harfbuzz test has a font with no name table.
-    }
-
-    // kbts_LoadFont sized the scratch memory as the two maps of kbts__byteswap_context,
-    // each as long as the largest table swapped through it.
+    // Byteswap it, one table at a time, through ByteSwapContext (kbts__byteswap_context):
+    // every pointer stays inside the table being swapped, and no byte is swapped twice.
+    // A table that fails a check is dropped when it is optional and rejects the font
+    // when it is required (kbts__EndByteSwapTable). kbts_LoadFont sized the scratch
+    // memory as the two maps of the context, each as long as the largest table.
     kbts__byteswap_context ByteSwapContext = KBTS__ZERO;
     ByteSwapContext.ScratchCapacity = State->ScratchSize / 2;
     ByteSwapContext.Swapped = (kbts_u8 *)ScratchMemory;
     ByteSwapContext.Visited = (kbts_u8 *)ScratchMemory + ByteSwapContext.ScratchCapacity;
 
     {
-      char *TableEnd;
-      kbts__fvar *Fvar = kbts__BlobTableHeaderChecked(Header, KBTS_BLOB_TABLE_ID_FVAR, kbts__fvar, &TableEnd, &Result);
-      if(Fvar)
+      kbts__head *Head = (kbts__head *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_HEAD);
+
+      // The magic number and the file times are not swapped.
+      if(Head && kbts__SwapOffset(&ByteSwapContext, Head, 0, sizeof(kbts__head)) &&
+         kbts__Swap16(&ByteSwapContext, &Head->Major, 2) &&
+         kbts__Swap32(&ByteSwapContext, &Head->Revision, 2) &&
+         kbts__Swap16(&ByteSwapContext, &Head->Flags, 2))
       {
-        kbts__ByteSwapArray16Unchecked(&Fvar->Major, 8);
+        kbts__Swap16(&ByteSwapContext, &Head->XMin, 9);
+      }
 
-        kbts__variation_axis_record *Axes = KBTS__POINTER_OFFSET(kbts__variation_axis_record, Fvar, Fvar->AxesArrayOffset);
-        kbts_un AxisCount = Fvar->AxisCount;
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_HEAD, &Result);
+    }
 
-        kbts__instance_record *Instances = (kbts__instance_record *)(Axes + AxisCount);
-        kbts_un InstanceCount = Fvar->InstanceCount;
-        kbts_un InstanceSize = Fvar->InstanceSize;
+    Font->Blob = Header;
 
-        if(((char *)Instances + Fvar->InstanceCount * Fvar->InstanceSize) <= TableEnd)
+    {
+      kbts__cmap *Cmap = (kbts__cmap *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_CMAP);
+
+      if(Cmap && kbts__Swap16(&ByteSwapContext, Cmap, 2))
+      {
+        kbts_un RecordCount = Cmap->TableCount;
+        kbts__encoding_record *Records = (kbts__encoding_record *)kbts__SwapArrayOffset(&ByteSwapContext, Cmap, sizeof(kbts__cmap), RecordCount, sizeof(kbts__encoding_record));
+
+        KBTS__FOR(It, 0, Records ? RecordCount : 0)
         {
-          KBTS__FOR(AxisIndex, 0, AxisCount)
+          kbts__encoding_record *Record = &Records[It];
+
+          if(!kbts__Swap16(&ByteSwapContext, &Record->PlatformId, 2) ||
+             !kbts__Swap32(&ByteSwapContext, &Record->SubtableOffset, 1))
           {
-            kbts__variation_axis_record *Axis = &Axes[AxisIndex];
-
-            kbts__ByteSwapArray32Unchecked((kbts_u32 *)&Axis->MinValue, 3);
-            kbts__ByteSwapArray16Unchecked(&Axis->Flags, 2);
+            break;
           }
+        }
 
-          kbts_b32 InstancesContainPostscriptNameId = (InstanceSize >= (sizeof(kbts__instance_record) + sizeof(kbts__fixed16_16) * AxisCount + sizeof(kbts_u16)));
+        kbts_u16 PreferredFormat = 1;
+        kbts__cmap_subtable_pointer PreferredSubtable = KBTS__ZERO;
 
-          KBTS__FOR(InstanceIndex, 0, InstanceCount)
-          {
-            kbts__instance_record *Instance = KBTS__POINTER_OFFSET(kbts__instance_record, Instances, InstanceIndex * InstanceSize);
-            kbts__fixed16_16 *InstanceCoordinates = KBTS__POINTER_AFTER(kbts__fixed16_16, Instance);
+        if(Records && !ByteSwapContext.Error)
+        {
+          PreferredSubtable = kbts__SelectCmapSubtable(Cmap, ByteSwapContext.TableEnd, &ByteSwapContext, &Font->Cmap14, &PreferredFormat);
+        }
 
-            Instance->SubfamilyNameId = kbts__ByteSwap16(Instance->SubfamilyNameId);
-            kbts__ByteSwapArray32Unchecked((kbts_u32 *)InstanceCoordinates, AxisCount);
-
-            if(InstancesContainPostscriptNameId)
-            {
-              kbts_u16 *InstancePostscriptNameId = (kbts_u16 *)(InstanceCoordinates + AxisCount);
-              *InstancePostscriptNameId = kbts__ByteSwap16(*InstancePostscriptNameId);
-            }
-          }
+        // A cmap with no subtable kb can map with is broken.
+        if(PreferredSubtable.Subtable)
+        {
+          kbts__ByteSwapCmapSubtable(&ByteSwapContext, PreferredSubtable.Subtable);
         }
         else
         {
-          Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+          ByteSwapContext.Error = 1;
         }
+
+        if(!ByteSwapContext.Error)
+        {
+          Font->Cmap = PreferredSubtable.Subtable;
+        }
+      }
+
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_CMAP, &Result);
+    }
+
+    {
+      kbts_blob_table_id HeaTableIds[2] = {KBTS_BLOB_TABLE_ID_HHEA, KBTS_BLOB_TABLE_ID_VHEA};
+      kbts_blob_table_id MtxTableIds[2] = {KBTS_BLOB_TABLE_ID_HMTX, KBTS_BLOB_TABLE_ID_VMTX};
+
+      KBTS__FOR(HeaTableIndex, 0, KBTS__ARRAY_LENGTH(HeaTableIds))
+      {
+        kbts__hea *Hea = (kbts__hea *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, HeaTableIds[HeaTableIndex]);
+
+        if(Hea)
+        {
+          kbts__Swap16(&ByteSwapContext, Hea, sizeof(kbts__hea) / sizeof(kbts_u16));
+        }
+
+        kbts__EndByteSwapTable(Header, &ByteSwapContext, HeaTableIds[HeaTableIndex], &Result);
+      }
+
+      KBTS__FOR(MtxTableIndex, 0, KBTS__ARRAY_LENGTH(MtxTableIds))
+      {
+        kbts_blob_table_id MtxTableId = MtxTableIds[MtxTableIndex];
+        kbts_u16 *Mtx = (kbts_u16 *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, MtxTableId);
+
+        if(Mtx && kbts__Swap16(&ByteSwapContext, Mtx, Header->Tables[MtxTableId].Length / sizeof(kbts_u16)))
+        {
+          // The metrics pass reads LongMetrics[Id] for an id below the metric count, and
+          // LongMetrics[MetricCount - 1] for any other id, so the count is at least 1 and
+          // that many long metrics fit in the table.
+          kbts__hea *Hea = kbts__BlobTableDataType(Header, HeaTableIds[MtxTableIndex], kbts__hea);
+
+          if(Hea && (!Hea->MetricCount || !kbts__SwapArrayOffset(&ByteSwapContext, Mtx, 0, Hea->MetricCount, sizeof(kbts__long_mtx))))
+          {
+            ByteSwapContext.Error = 1;
+          }
+        }
+
+        kbts__EndByteSwapTable(Header, &ByteSwapContext, MtxTableId, &Result);
       }
     }
 
     {
-      char *TableEnd;
-      kbts__avar *Avar = kbts__BlobTableHeaderChecked(Header, KBTS_BLOB_TABLE_ID_AVAR, kbts__avar, &TableEnd, &Result);
-      if(Avar)
+      kbts__maxp *Maxp = (kbts__maxp *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_MAXP);
+
+      if(Maxp && kbts__Swap16(&ByteSwapContext, Maxp, 2) &&
+         kbts__SwapOffset(&ByteSwapContext, Maxp, 0, kbts__MaxpSize(((kbts_u32)Maxp->Major << 16) | Maxp->Minor)))
       {
-        kbts__ByteSwapArray16Unchecked(&Avar->Major, 4);
+        kbts_un U16Count = ((Maxp->Major == 1) ? (sizeof(kbts__maxp) - 4) : 2) / sizeof(kbts_u16);
 
-        char *At = KBTS__POINTER_AFTER(char, Avar);
-        KBTS__FOR(AxisIndex, 0, Avar->AxisCount)
+        // kbts_LoadFont sized the matrices from this count, read under the same rule.
+        if(kbts__Swap16(&ByteSwapContext, &Maxp->GlyphCount, U16Count) &&
+           (Maxp->GlyphCount != State->GlyphCount))
         {
-          kbts__segment_maps *SegmentMaps = (kbts__segment_maps *)At;
+          ByteSwapContext.Error = 1;
+        }
+      }
 
-          if((char *)(SegmentMaps + 1) <= TableEnd)
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_MAXP, &Result);
+
+      Header->GlyphCount = State->GlyphCount;
+    }
+
+    {
+      kbts__os2 *Os2 = (kbts__os2 *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_OS2);
+
+      // Version 0 ends at 68 bytes in Apple's fonts, at 78 in Microsoft's. A version
+      // that promises fields the table does not have is broken. kbts_GetFontInfo2
+      // reads the typographic and cap height fields only when the table holds them.
+      if(Os2 && kbts__SwapOffset(&ByteSwapContext, Os2, 0, 68) &&
+         kbts__Swap16(&ByteSwapContext, &Os2->Version, 16) &&
+         kbts__Swap32(&ByteSwapContext, Os2->UnicodeRange, 4) &&
+         kbts__Swap16(&ByteSwapContext, &Os2->Selection, 3))
+      {
+        kbts_un Length = Header->Tables[KBTS_BLOB_TABLE_ID_OS2].Length;
+        kbts_un Version = Os2->Version;
+
+        if((Length >= 78) && kbts__Swap16(&ByteSwapContext, &Os2->TypoAscender, 5) && (Version >= 1))
+        {
+          if(kbts__Swap32(&ByteSwapContext, Os2->CodePageRange, 2) && (Version >= 2) &&
+             kbts__Swap16(&ByteSwapContext, &Os2->Height, 5) && (Version >= 5))
           {
-            SegmentMaps->PositionMapCount = kbts__ByteSwap16(SegmentMaps->PositionMapCount);
+            kbts__Swap16(&ByteSwapContext, &Os2->LowerOpticalPointSize, 2);
+          }
+        }
+      }
 
-            kbts__axis_value_map *AxisValueMaps = KBTS__POINTER_AFTER(kbts__axis_value_map, SegmentMaps);
-            if(kbts__ByteSwapArray16((kbts_u16 *)&AxisValueMaps->FromCoordinate, 2 * SegmentMaps->PositionMapCount, TableEnd))
-            {
-              At = (char *)(AxisValueMaps + SegmentMaps->PositionMapCount);
-            }
-            else
-            {
-              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_OS2, &Result);
+    }
 
+    {
+      kbts__name *Name = (kbts__name *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_NAME);
+
+      if(Name && kbts__Swap16(&ByteSwapContext, Name, 3))
+      {
+        kbts_un RecordCount = Name->Count;
+        kbts__name_record *Records = (kbts__name_record *)kbts__SwapArrayOffset(&ByteSwapContext, Name, sizeof(kbts__name), RecordCount, sizeof(kbts__name_record));
+
+        // Every string that a record names must lie inside the table: the shape config
+        // hash, kbts_GetFontInfo2 and kbts_GetFontInfoString read them.
+        if(Records && kbts__Swap16(&ByteSwapContext, Records, RecordCount * 6))
+        {
+          KBTS__FOR(RecordIndex, 0, RecordCount)
+          {
+            kbts__name_record *Record = &Records[RecordIndex];
+
+            if(!kbts__SwapOffset(&ByteSwapContext, Name, (kbts_un)Name->StringStorageOffset + Record->StringOffset, Record->Length))
+            {
               break;
             }
           }
-          else
-          {
-            Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+        }
+      }
 
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_NAME, &Result);
+    }
+
+    {
+      kbts__fvar *Fvar = (kbts__fvar *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_FVAR);
+
+      if(Fvar && kbts__Swap16(&ByteSwapContext, Fvar, 8))
+      {
+        kbts_un AxisCount = Fvar->AxisCount;
+        kbts_un InstanceCount = Fvar->InstanceCount;
+        kbts_un InstanceSize = Fvar->InstanceSize;
+
+        // kb steps through the axes by sizeof(kbts__variation_axis_record), and
+        // kbts_GetVariationInstance by AxisSize: they agree only at 20, the size the
+        // OpenType spec gives. An instance holds a name id, flags, and one 32-bit
+        // coordinate per axis, so a smaller instance overlaps the next one.
+        if((Fvar->AxisSize != sizeof(kbts__variation_axis_record)) ||
+           (InstanceSize < (sizeof(kbts__instance_record) + sizeof(kbts__fixed16_16) * AxisCount)))
+        {
+          ByteSwapContext.Error = 1;
+        }
+
+        kbts__variation_axis_record *Axes = (kbts__variation_axis_record *)kbts__SwapArrayOffset(&ByteSwapContext, Fvar, Fvar->AxesArrayOffset, AxisCount, sizeof(kbts__variation_axis_record));
+        char *Instances = (char *)kbts__SwapArrayOffset(&ByteSwapContext, Axes, AxisCount * sizeof(kbts__variation_axis_record), InstanceCount, InstanceSize);
+
+        KBTS__FOR(AxisIndex, 0, Instances ? AxisCount : 0)
+        {
+          kbts__variation_axis_record *Axis = &Axes[AxisIndex];
+
+          if(!kbts__Swap32(&ByteSwapContext, &Axis->MinValue, 3) ||
+             !kbts__Swap16(&ByteSwapContext, &Axis->Flags, 2))
+          {
+            break;
+          }
+        }
+
+        kbts_b32 InstancesContainPostscriptNameId = (InstanceSize >= (sizeof(kbts__instance_record) + sizeof(kbts__fixed16_16) * AxisCount + sizeof(kbts_u16)));
+
+        KBTS__FOR(InstanceIndex, 0, Instances ? InstanceCount : 0)
+        {
+          kbts__instance_record *Instance = (kbts__instance_record *)(Instances + InstanceIndex * InstanceSize);
+          kbts__fixed16_16 *InstanceCoordinates = KBTS__POINTER_AFTER(kbts__fixed16_16, Instance);
+
+          if(!kbts__Swap16(&ByteSwapContext, &Instance->SubfamilyNameId, 1) ||
+             !kbts__Swap32(&ByteSwapContext, InstanceCoordinates, AxisCount) ||
+             (InstancesContainPostscriptNameId && !kbts__Swap16(&ByteSwapContext, InstanceCoordinates + AxisCount, 1)))
+          {
             break;
           }
         }
       }
+
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_FVAR, &Result);
     }
 
-    // HVAR, VVAR, MVAR, GDEF, GSUB and GPOS are swapped through ByteSwapContext, one
-    // table at a time. These tables are optional: a table that fails a check is dropped
-    // (kbts__DropTableOnByteSwapError), and kb shapes as if the font did not have it.
+    {
+      kbts__avar *Avar = (kbts__avar *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_AVAR);
+
+      if(Avar && kbts__Swap16(&ByteSwapContext, Avar, 4))
+      {
+        // kbts_NormalizeVariationVector reads one segment map per fvar axis.
+        kbts__fvar *Fvar = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_FVAR, kbts__fvar);
+
+        if(Fvar && (Avar->AxisCount < Fvar->AxisCount))
+        {
+          ByteSwapContext.Error = 1;
+        }
+
+        // Each segment map is a count, then that many pairs of coordinates.
+        kbts_u16 *At = KBTS__POINTER_AFTER(kbts_u16, Avar);
+        KBTS__FOR(AxisIndex, 0, Avar->AxisCount)
+        {
+          kbts_un PositionMapCount = 0;
+          kbts_u16 *AxisValueMaps = kbts__SwapCountedArray16(&ByteSwapContext, At, 2, &PositionMapCount);
+
+          if(!AxisValueMaps)
+          {
+            break;
+          }
+
+          At = AxisValueMaps + PositionMapCount * 2;
+        }
+      }
+
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_AVAR, &Result);
+    }
+
+    // HVAR, VVAR, MVAR, GDEF, GSUB and GPOS are optional: a table that fails a check is
+    // dropped, and kb shapes as if the font did not have it.
     {
       kbts_blob_table_id TableIds[] = {KBTS_BLOB_TABLE_ID_HVAR, KBTS_BLOB_TABLE_ID_VVAR};
 
@@ -29267,7 +29235,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
           }
         }
 
-        kbts__DropTableOnByteSwapError(Header, &ByteSwapContext, TableId);
+        kbts__EndByteSwapTable(Header, &ByteSwapContext, TableId, &Result);
       }
     }
 
@@ -29303,7 +29271,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
         }
       }
 
-      kbts__DropTableOnByteSwapError(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_MVAR);
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_MVAR, &Result);
     }
 
     {
@@ -29352,7 +29320,7 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
         }
       }
 
-      kbts__DropTableOnByteSwapError(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_GDEF);
+      kbts__EndByteSwapTable(Header, &ByteSwapContext, KBTS_BLOB_TABLE_ID_GDEF, &Result);
     }
 
     {
@@ -29405,24 +29373,29 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
           }
         }
 
-        kbts__DropTableOnByteSwapError(Header, &ByteSwapContext, TableId);
+        kbts__EndByteSwapTable(Header, &ByteSwapContext, TableId, &Result);
       }
     }
 
     // At this point, we are done byteswapping the file, so we can start reusing scratch memory.
 
-    kbts__gdef *Gdef = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_GDEF, kbts__gdef);
-
     // Bake our own data.
+    //
+    // The bake reads only GSUB and GPOS structures that the byte swap walked, in the same
+    // way the walk read them, so every offset and count it follows was checked there. What
+    // it adds are indices into kb's own arrays, sized by kbts_LoadFont from the same font:
+    // each lookup and subtable index is checked against those counts, and each glyph id
+    // against the glyph count before it sets a matrix bit. It runs also without maxp (0
+    // glyphs), so that the lookup offsets shaping reads always exist.
 
-    if(!Result && Header->Tables[KBTS_BLOB_TABLE_ID_MAXP].Length)
+    if(!Result)
     {
       kbts_un GlyphCount = Header->GlyphCount;
       kbts_un LookupCount = Header->LookupCount;
       kbts_un SubtableCount = Header->LookupSubtableCount;
 
       kbts__bake_budget Budget = KBTS__ZERO;
-      Budget.Max = KBTS__MAX((kbts_un)State->FontDataSize * KBTS_BAKE_OPS_FACTOR, (kbts_un)KBTS_BAKE_OPS_MIN);
+      Budget.Max = KBTS__MAX(kbts__ArraySize(State->FontDataSize, KBTS_BAKE_OPS_FACTOR), (kbts_un)KBTS_BAKE_OPS_MIN);
 
       kbts_u32 *GlyphLookupMatrix = kbts__PointerPushArray(&Bump, kbts_u32, State->GlyphLookupMatrixSizeInBytes / sizeof(kbts_u32));
       kbts_u32 *GlyphLookupSubtableMatrix = kbts__PointerPushArray(&Bump, kbts_u32, State->GlyphLookupSubtableMatrixSizeInBytes / sizeof(kbts_u32));
@@ -29459,7 +29432,23 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                 goto BakeDone;
               }
               kbts__lookup *PackedLookup = kbts__GetLookup(LookupList, LookupIndex);
-              kbts__unpacked_lookup Lookup = kbts__UnpackLookup(Gdef, PackedLookup);
+
+              // The byte swap read the type and the subtable offsets of this lookup the
+              // same way; kbts__UnpackLookup would also read GDEF, which the bake does not need.
+              kbts__unpacked_lookup Lookup = KBTS__ZERO;
+              Lookup.Type = PackedLookup->Type;
+              Lookup.SubtableCount = PackedLookup->SubtableCount;
+              Lookup.SubtableOffsets = KBTS__POINTER_AFTER(kbts_u16, PackedLookup);
+
+              // kbts_LoadFont counted the lookups and subtables of the same lookup lists
+              // to size LookupSubtableIndexOffsets and the matrices. More here would write
+              // past them.
+              if((RunningLookupIndex >= LookupCount) ||
+                 (Lookup.SubtableCount > (SubtableCount - RunningSubtableIndex)))
+              {
+                Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                goto BakeDone;
+              }
 
               LookupSubtableIndexOffsets[RunningLookupIndex] = (kbts_u32)RunningSubtableIndex;
 
@@ -29504,10 +29493,19 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                       KBTS__FOR(IdIndex, 1, Ligature->ComponentCount)
                       {
-                        kbts_un GlyphId = Ids[IdIndex - 1];
+                        if(++Budget.Ops > Budget.Max)
+                        {
+                          Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                          goto BakeDone;
+                        }
+                        kbts_un GlyphId = kbts__ReadU16Unaligned(&Ids[IdIndex - 1]);
 
-                        kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
-                        GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
+                        // A glyph id the font does not have would index past the end of the matrix.
+                        if(GlyphId < GlyphCount)
+                        {
+                          kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
+                          GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
+                        }
                       }
                     }
                   }
@@ -29597,12 +29595,17 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                     KBTS__FOR(CoverageIndex, 1, Subst->GlyphCount)
                     {
-                      kbts__coverage *SubstCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, CoverageOffsets[CoverageIndex]);
+                      kbts__coverage *SubstCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&CoverageOffsets[CoverageIndex]));
 
                       kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubstCoverage, 1, &Budget);
                     }
 
-                    Coverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, CoverageOffsets[0]);
+                    // With no input glyphs there is no first coverage: the value after
+                    // the count is a lookup record, or past the subtable.
+                    if(Subst->GlyphCount)
+                    {
+                      Coverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&CoverageOffsets[0]));
+                    }
                   } break;
                   }
                 }
@@ -29614,35 +29617,40 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                   case 1:
                   {
                     kbts__chained_sequence_context_1 *Subst = (kbts__chained_sequence_context_1 *)Base;
-                    kbts_u16 *ChainedSequenceRuleSetOffsets = KBTS__POINTER_AFTER(kbts_u16, Subst);
 
                     KBTS__FOR(SetIndex, 0, Subst->ChainedSequenceRuleSetCount)
                     {
-                      kbts__chained_sequence_rule_set *Set = KBTS__POINTER_OFFSET(kbts__chained_sequence_rule_set, Subst, ChainedSequenceRuleSetOffsets[SetIndex]);
-                      KBTS__FOR(RuleIndex, 0, Set->Count)
+                      // An offset of 0 is no rule set; the byte swap did not walk one there.
+                      kbts__chained_sequence_rule_set *Set = kbts__GetChainedSequenceRuleSet(Subst, SetIndex);
+
+                      KBTS__FOR(RuleIndex, 0, Set ? Set->Count : 0)
                       {
-                        kbts__chained_sequence_rule *Rule = kbts__GetChainedClassSequenceRule(Set, RuleIndex);
+                        kbts__chained_sequence_rule *Rule = kbts__GetChainedSequenceRule(Set, RuleIndex);
                         kbts__unpacked_chained_sequence_rule Unpacked = kbts__UnpackChainedSequenceRule(Rule);
 
-                        KBTS__FOR(BacktrackIndex, 0, Unpacked.BacktrackCount)
-                        {
-                          kbts_un GlyphId = Unpacked.Backtrack[BacktrackIndex];
-                          kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
-                          GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
-                        }
+                        // Backtrack, input after the first glyph, and lookahead: every glyph
+                        // id of the rule. A glyph id the font does not have would index past
+                        // the end of the matrix.
+                        kbts_u16 *Sequences[3] = {Unpacked.Backtrack, Unpacked.Input, Unpacked.Lookahead};
+                        kbts_un SequenceCounts[3] = {Unpacked.BacktrackCount, (kbts_un)Unpacked.InputCount - 1, Unpacked.LookaheadCount};
 
-                        KBTS__FOR(InputIndex, 1, Unpacked.InputCount)
+                        KBTS__FOR(SequenceIndex, 0, 3)
                         {
-                          kbts_un GlyphId = Unpacked.Input[InputIndex - 1];
-                          kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
-                          GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
-                        }
+                          KBTS__FOR(GlyphIndex, 0, SequenceCounts[SequenceIndex])
+                          {
+                            if(++Budget.Ops > Budget.Max)
+                            {
+                              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                              goto BakeDone;
+                            }
+                            kbts_un GlyphId = kbts__ReadU16Unaligned(&Sequences[SequenceIndex][GlyphIndex]);
 
-                        KBTS__FOR(LookaheadIndex, 0, Unpacked.LookaheadCount)
-                        {
-                          kbts_un GlyphId = Unpacked.Lookahead[LookaheadIndex];
-                          kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
-                          GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
+                            if(GlyphId < GlyphCount)
+                            {
+                              kbts__matrix_index SubtableMatrixIndex = kbts__GlyphLookupSubtableMatrixIndex(RunningSubtableIndex, SubtableCount, GlyphId, GlyphCount);
+                              GlyphLookupSubtableMatrix[SubtableMatrixIndex.WordIndex] |= 1u << SubtableMatrixIndex.BitIndex;
+                            }
+                          }
                         }
                       }
                     }
@@ -29686,7 +29694,12 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                           KBTS__FOR(BacktrackIndex, 0, Unpacked.BacktrackCount)
                           {
-                            kbts_un Class = Unpacked.Backtrack[BacktrackIndex];
+                            if(++Budget.Ops > Budget.Max)
+                            {
+                              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                              goto BakeDone;
+                            }
+                            kbts_un Class = kbts__ReadU16Unaligned(&Unpacked.Backtrack[BacktrackIndex]);
                             if(Class < (KBTS__ARRAY_LENGTH(BacktrackClassesIncluded) * 64))
                             {
                               BacktrackClassesIncluded[Class / 64] |= 1ull << (Class % 64);
@@ -29695,7 +29708,12 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                           KBTS__FOR(InputIndex, 1, Unpacked.InputCount)
                           {
-                            kbts_un Class = Unpacked.Input[InputIndex - 1];
+                            if(++Budget.Ops > Budget.Max)
+                            {
+                              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                              goto BakeDone;
+                            }
+                            kbts_un Class = kbts__ReadU16Unaligned(&Unpacked.Input[InputIndex - 1]);
                             if(Class < (KBTS__ARRAY_LENGTH(InputClassesIncluded) * 64))
                             {
                               InputClassesIncluded[Class / 64] |= 1ull << (Class % 64);
@@ -29704,7 +29722,12 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                           KBTS__FOR(LookaheadIndex, 0, Unpacked.LookaheadCount)
                           {
-                            kbts_un Class = Unpacked.Lookahead[LookaheadIndex];
+                            if(++Budget.Ops > Budget.Max)
+                            {
+                              Result = KBTS_LOAD_FONT_ERROR_INVALID_FONT;
+                              goto BakeDone;
+                            }
+                            kbts_un Class = kbts__ReadU16Unaligned(&Unpacked.Lookahead[LookaheadIndex]);
                             if(Class < (KBTS__ARRAY_LENGTH(LookaheadClassesIncluded) * 64))
                             {
                               LookaheadClassesIncluded[Class / 64] |= 1ull << (Class % 64);
@@ -29724,24 +29747,29 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
                     kbts__chained_sequence_context_3 *Subst = (kbts__chained_sequence_context_3 *)Base;
                     kbts__unpacked_chained_sequence_context_3 Unpacked = kbts__UnpackChainedSequenceContext3(Subst);
 
-                    Coverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.InputCoverageOffsets[0]);
+                    // With no input glyphs there is no first coverage: the value there is
+                    // the lookahead count.
+                    if(Unpacked.InputCount)
+                    {
+                      Coverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&Unpacked.InputCoverageOffsets[0]));
+                    }
 
                     KBTS__FOR(BacktrackCoverageIndex, 0, Unpacked.BacktrackCount)
                     {
-                      kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.BacktrackCoverageOffsets[BacktrackCoverageIndex]);
+                      kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&Unpacked.BacktrackCoverageOffsets[BacktrackCoverageIndex]));
                       kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                     }
 
                     KBTS__FOR(InputCoverageIndex, 1, Unpacked.InputCount)
                     {
-                      kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.InputCoverageOffsets[InputCoverageIndex]);
+                      kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&Unpacked.InputCoverageOffsets[InputCoverageIndex]));
                       kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                     }
 
 
                     KBTS__FOR(LookaheadCoverageIndex, 0, Unpacked.LookaheadCount)
                     {
-                      kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.LookaheadCoverageOffsets[LookaheadCoverageIndex]);
+                      kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&Unpacked.LookaheadCoverageOffsets[LookaheadCoverageIndex]));
                       kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                     }
                   } break;
@@ -29754,13 +29782,13 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
                   KBTS__FOR(BacktrackIndex, 0, Unpacked.BacktrackCount)
                   {
-                    kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.BacktrackCoverageOffsets[BacktrackIndex]);
+                    kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&Unpacked.BacktrackCoverageOffsets[BacktrackIndex]));
                     kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                   }
 
                   KBTS__FOR(LookaheadIndex, 0, Unpacked.LookaheadCount)
                   {
-                    kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, Unpacked.LookaheadCoverageOffsets[LookaheadIndex]);
+                    kbts__coverage *SubCoverage = KBTS__POINTER_OFFSET(kbts__coverage, Subst, kbts__ReadU16Unaligned(&Unpacked.LookaheadCoverageOffsets[LookaheadIndex]));
                     kbts__MarkMatrixCoverage(GlyphLookupSubtableMatrix, RunningSubtableIndex, SubtableCount, GlyphCount, SubCoverage, 1, &Budget);
                   }
                 }
@@ -29826,7 +29854,8 @@ KBTS_EXPORT void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info)
       {
         kbts_font_info2_2 *Info2_2 = (kbts_font_info2_2 *)Info;
 
-        if(Os2)
+        // OS/2 version 0 and 1 tables end before the cap height.
+        if(Os2 && (Blob->Tables[KBTS_BLOB_TABLE_ID_OS2].Length >= 90))
         {
           Info2_2->CapitalHeight = Os2->CapHeight;
         }
@@ -29837,7 +29866,8 @@ KBTS_EXPORT void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info)
       {
         kbts_font_info2_1 *Info2_1 = (kbts_font_info2_1 *)Info;
 
-        if(Os2)
+        // Apple's OS/2 version 0 tables end before the typographic metrics.
+        if(Os2 && (Blob->Tables[KBTS_BLOB_TABLE_ID_OS2].Length >= 74))
         {
           Info2_1->Ascent = Os2->TypoAscender;
           Info2_1->Descent = Os2->TypoDescender;
