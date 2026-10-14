@@ -15500,7 +15500,10 @@ static float kbts__ItemVariationStoreDelta(kbts__item_variation_store *Store, kb
 
     kbts__item_variation_data *ItemVariationData = KBTS__POINTER_OFFSET(kbts__item_variation_data, Store, ItemVariationDataOffset);
     kbts_un RegionIndexCount = ItemVariationData->RegionIndexCount;
-    // Bit 15 (LONG_WORDS) is not supported; the load swapped rows without it.
+    // Bit 15 (LONG_WORDS) makes the wide deltas 32-bit and the narrow ones 16-bit,
+    // instead of 16-bit and 8-bit. The load swapped and bounded the rows the same way
+    // (kbts__ByteSwapItemVariationData).
+    kbts_un LongWords = ItemVariationData->WordDeltaCount & 0x8000;
     kbts_un WordDeltaCount = ItemVariationData->WordDeltaCount & 0x7FFF;
 
     if(DeltaSetInnerIndex >= ItemVariationData->ItemCount)
@@ -15510,8 +15513,9 @@ static float kbts__ItemVariationStoreDelta(kbts__item_variation_store *Store, kb
 
     kbts_u16 *RegionIndices = KBTS__POINTER_AFTER(kbts_u16, ItemVariationData);
     char *Deltas = (char *)(RegionIndices + RegionIndexCount);
-    kbts_s16 *WordDeltas = (kbts_s16 *)(Deltas + DeltaSetInnerIndex * (WordDeltaCount + RegionIndexCount));
-    kbts_s8 *HalfWordDeltas = (kbts_s8 *)(WordDeltas + WordDeltaCount);
+    kbts_un RowSize = (WordDeltaCount + RegionIndexCount) * (LongWords ? 2 : 1);
+    char *WordDeltas = Deltas + DeltaSetInnerIndex * RowSize;
+    char *HalfWordDeltas = WordDeltas + WordDeltaCount * (LongWords ? sizeof(kbts_s32) : sizeof(kbts_s16));
 
     KBTS__FOR(RegionIndexIndex, 0, ItemVariationData->RegionIndexCount)
     {
@@ -15525,13 +15529,27 @@ static float kbts__ItemVariationStoreDelta(kbts__item_variation_store *Store, kb
       kbts__region_axis_coordinates *RegionCoords = &RegionAxisCoordinates[RegionIndex * AxisCount];
 
       float RegionDelta = 0;
-      if(RegionIndexIndex < WordDeltaCount)
+      if(LongWords)
       {
-        RegionDelta = (float)kbts__ReadS16Unaligned(&WordDeltas[RegionIndexIndex]);
+        if(RegionIndexIndex < WordDeltaCount)
+        {
+          RegionDelta = (float)(kbts_s32)kbts__ReadU32Unaligned((kbts_u32 *)(WordDeltas + RegionIndexIndex * sizeof(kbts_s32)));
+        }
+        else
+        {
+          RegionDelta = (float)kbts__ReadS16Unaligned((kbts_s16 *)(HalfWordDeltas + (RegionIndexIndex - WordDeltaCount) * sizeof(kbts_s16)));
+        }
       }
       else
       {
-        RegionDelta = (float)HalfWordDeltas[RegionIndexIndex - WordDeltaCount];
+        if(RegionIndexIndex < WordDeltaCount)
+        {
+          RegionDelta = (float)kbts__ReadS16Unaligned((kbts_s16 *)(WordDeltas + RegionIndexIndex * sizeof(kbts_s16)));
+        }
+        else
+        {
+          RegionDelta = (float)((kbts_s8 *)HalfWordDeltas)[RegionIndexIndex - WordDeltaCount];
+        }
       }
 
       float RegionFactor = 1;
@@ -15584,6 +15602,21 @@ static float kbts__ItemVariationStoreDelta(kbts__item_variation_store *Store, kb
       }
 
       Result += RegionDelta * RegionFactor;
+    }
+
+    // Shaping rounds the delta to an int with kbts__Round32 (advances, anchors, value
+    // records), and converting a float outside the int range is undefined behaviour (or
+    // INT_MIN, with SSE2, or whatever a caller's own kbts__Round32 does). One 32-bit
+    // (LONG_WORDS) delta alone can reach 2^31, and many regions can add past it, so the
+    // sum is clamped here, for every rounding path. 2147483520 is the largest float
+    // below 2^31.
+    if(Result > 2147483520.0f)
+    {
+      Result = 2147483520.0f;
+    }
+    else if(Result < -2147483648.0f)
+    {
+      Result = -2147483648.0f;
     }
   }
 
@@ -15977,14 +16010,17 @@ static void kbts__ResolveAnchorXy(kbts_shape_scratchpad *Scratchpad, kbts__ancho
     {
       kbts__device *Device = KBTS__POINTER_OFFSET(kbts__device, Anchor, Anchor->U.XDeviceOffset);
       float DeviceDelta = kbts__ResolveDevice(GdefItemVariationStore, VariationVectorNormalized, Device);
-      X += kbts__Round32(DeviceDelta);
+      // Narrowed to 16 bits like a value record's device delta (kbts__ResolveValueRecord),
+      // so an anchor stays inside the range the positioning sums were written for. A
+      // 32-bit (LONG_WORDS) delta would otherwise overflow X and the anchor differences.
+      X += (kbts_s16)kbts__Round32(DeviceDelta);
     }
 
     if(Anchor->YDeviceOffset)
     {
       kbts__device *Device = KBTS__POINTER_OFFSET(kbts__device, Anchor, Anchor->YDeviceOffset);
       float DeviceDelta = kbts__ResolveDevice(GdefItemVariationStore, VariationVectorNormalized, Device);
-      Y += kbts__Round32(DeviceDelta);
+      Y += (kbts_s16)kbts__Round32(DeviceDelta);
     }
   }
 
@@ -16757,16 +16793,16 @@ static void kbts__ByteSwapAnchor(kbts__byteswap_context *Context, void *Parent, 
     if(kbts__Swap16(Context, &Anchor->X, U16Count) &&
        (Anchor->Format == 3))
     {
-      // kbts__ResolveAnchorXy reads these device tables, so they must lie inside the
-      // table. kb has never swapped them, so shaping reads their DeltaFormat in file
-      // order and applies no delta; swapping them here would change shaping results.
+      // kbts__ResolveAnchorXy reads these device tables in native order, the same way
+      // kbts__ResolveValueRecord reads a value record's. They go through the same walk,
+      // so a device that an anchor and a value record share is swapped once.
       if(Anchor->U.XDeviceOffset)
       {
-        kbts__SwapOffset(Context, Anchor, Anchor->U.XDeviceOffset, sizeof(kbts__device));
+        kbts__ByteSwapDevice(Context, Anchor, Anchor->U.XDeviceOffset);
       }
       if(Anchor->YDeviceOffset)
       {
-        kbts__SwapOffset(Context, Anchor, Anchor->YDeviceOffset, sizeof(kbts__device));
+        kbts__ByteSwapDevice(Context, Anchor, Anchor->YDeviceOffset);
       }
     }
   }
@@ -16894,34 +16930,50 @@ static void kbts__ByteSwapItemVariationData(kbts__byteswap_context *Context, voi
   if(kbts__FirstVisit(Context, Data, KBTS__SWAP_VISIT_ITEM_VARIATION_DATA) &&
      kbts__Swap16(Context, Data, 3))
   {
-    // From the Microsoft docs:
-    //   The LONG_WORDS flag should only be used in top-level tables that include
-    //   32-bit values that can be variable - currently, only the COLR table.
-    // As such, we do not care about (Data->WordDeltaCount & 0x8000).
+    // Bit 15 of WordDeltaCount (LONG_WORDS) selects the row layout; the rest is the
+    // count of wide deltas. The spec says only COLR should set it, but a font can set
+    // it in any store (HarfBuzz's 32bit_var_store.otf sets it in HVAR), and HarfBuzz
+    // reads it in every store, so kb does as well.
+    // The flag stays in the swapped value: kbts__ItemVariationStoreDelta reads it.
+    kbts_un LongWords = Data->WordDeltaCount & 0x8000;
     kbts_un WordDeltaCount = Data->WordDeltaCount & 0x7FFF;
     kbts_un RegionIndexCount = Data->RegionIndexCount;
     kbts_un ItemCount = Data->ItemCount;
     kbts_u16 *RegionIndices = KBTS__POINTER_AFTER(kbts_u16, Data);
 
-    // A row is WordDeltaCount 16-bit deltas, then RegionIndexCount - WordDeltaCount
-    // 8-bit deltas. More words than regions has no layout.
+    // Without LONG_WORDS, a row is WordDeltaCount 16-bit deltas, then
+    // RegionIndexCount - WordDeltaCount 8-bit deltas. With it, the same counts of
+    // 32-bit and 16-bit deltas, so a row is twice as long. More wide deltas than
+    // regions has no layout.
     if(WordDeltaCount > RegionIndexCount)
     {
       Context->Error = 1;
     }
     else if(kbts__Swap16(Context, RegionIndices, RegionIndexCount))
     {
-      kbts_un RowSize = RegionIndexCount + WordDeltaCount;
+      kbts_un RowSize = (RegionIndexCount + WordDeltaCount) * (LongWords ? 2 : 1);
       char *Rows = (char *)kbts__SwapArrayOffset(Context, RegionIndices, RegionIndexCount * sizeof(kbts_u16), ItemCount, RowSize);
 
       KBTS__FOR(ItemIndex, 0, Rows ? ItemCount : 0)
       {
         char *Row = Rows + ItemIndex * RowSize;
+        kbts_un NarrowDeltaCount = RegionIndexCount - WordDeltaCount;
+        int Swapped = 0;
 
-        // The 8-bit deltas after the 16-bit ones are kept as bytes, so that no
-        // overlapping structure swaps them.
-        if(!kbts__Swap16(Context, Row, WordDeltaCount) ||
-           !kbts__KeepBytes(Context, Row + WordDeltaCount * sizeof(kbts_u16), RegionIndexCount - WordDeltaCount))
+        if(LongWords)
+        {
+          Swapped = kbts__Swap32(Context, Row, WordDeltaCount) &&
+                    kbts__Swap16(Context, Row + WordDeltaCount * sizeof(kbts_u32), NarrowDeltaCount);
+        }
+        else
+        {
+          // The 8-bit deltas after the 16-bit ones are kept as bytes, so that no
+          // overlapping structure swaps them.
+          Swapped = kbts__Swap16(Context, Row, WordDeltaCount) &&
+                    kbts__KeepBytes(Context, Row + WordDeltaCount * sizeof(kbts_u16), NarrowDeltaCount);
+        }
+
+        if(!Swapped)
         {
           break;
         }
@@ -23007,6 +23059,7 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
           }
         }
 
+        kbts_s32 Advance = Metric.Advance;
         if(Hvar)
         {
           kbts_un OuterIndex = 0;
@@ -23059,7 +23112,25 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
           }
 
           float Delta = kbts__ItemVariationStoreDelta(HvarStore, OuterIndex, InnerIndex, VariationVectorNormalized);
-          Metric.Advance += (kbts_u16)kbts__Round32(Delta);
+          kbts_s32 RoundedDelta = kbts__Round32(Delta);
+
+          // HarfBuzz gives max(0, advance + round(delta)). The sum is not narrowed to the
+          // 16 bits of the hmtx advance: a 32-bit (LONG_WORDS) delta can take it past
+          // 65535. It is capped at 2^24, the largest range in which a float delta holds
+          // every integer, so the GPOS sums that start from this advance keep room
+          // before kbts_s32 overflows.
+          if(RoundedDelta <= -Advance)
+          {
+            Advance = 0;
+          }
+          else if(RoundedDelta >= (1 << 24) - Advance)
+          {
+            Advance = 1 << 24;
+          }
+          else
+          {
+            Advance += RoundedDelta;
+          }
         }
 
         if(!ClearMarkAdvances | (Glyph->Classes.Class != KBTS__GLYPH_CLASS_MARK))
@@ -23069,14 +23140,14 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
             // :LeftSideBearing
             // Why does harfbuzz not take bearings into account in these tests?
             // P.X += Metric.PreviousSideBearing;
-            Glyph->AdvanceX = Metric.Advance;
+            Glyph->AdvanceX = Advance;
           }
           else
           {
             // :LeftSideBearing
             // Why does harfbuzz not take bearings into account in these tests?
             // P.Y += Metric.PreviousSideBearing;
-            Glyph->AdvanceY = Metric.Advance;
+            Glyph->AdvanceY = Advance;
           }
         }
       }
