@@ -29505,9 +29505,16 @@ KBTS_EXPORT kbts_font kbts_FontFromMemory(void *FileData, int FileSize, int Font
       void *ScratchMemory = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)ScratchSize);
       void *OutputMemory = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)OutputSize);
 
-      kbts_PlaceBlob(&Result, &LoadFontState, ScratchMemory, OutputMemory);
+      kbts_load_font_error PlaceError = kbts_PlaceBlob(&Result, &LoadFontState, ScratchMemory, OutputMemory);
 
       kbts__AllocatorFree(Allocator, AllocatorData, ScratchMemory);
+      // PlaceBlob clears Font->Blob on failure, so kbts_FreeFont cannot free
+      // OutputMemory. A scratch allocation that fails on its own is the case:
+      // the output buffer was allocated and would otherwise stay live.
+      if(PlaceError != KBTS_LOAD_FONT_ERROR_NONE)
+      {
+        kbts__AllocatorFree(Allocator, AllocatorData, OutputMemory);
+      }
 
       Result.Allocator = Allocator;
       Result.AllocatorData = AllocatorData;
