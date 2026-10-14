@@ -191,6 +191,16 @@
       internally, these coordinates are normalized to 16-bit fixed-point, so some of our
       lower-level functions expect normalized input. (See kbts_NormalizeVariationVector.)
 
+      Horizontal advances vary with the font's HVAR table when it has one. A TrueType font
+      without HVAR keeps them in gvar, as "phantom points", and kb reads them from there,
+      as HarfBuzz does. A font with neither keeps its hmtx advances at every instance.
+      (See kbts_GetGlyphAdvanceX.)
+      These are not handled: vertical advances (VVAR, and gvar's vertical phantom points),
+      cvar, and CFF2's own variation data (a CFF2 font varies its advances only through
+      HVAR). An avar version 2 table is read as if it were version 1:
+      its segment maps are applied, and its axis mapping and variation store are ignored,
+      so such a font is normalized differently from HarfBuzz.
+
       Furthermore, there are two ways to represent a set of variations. One is an
       array of coordinates, each applying to exactly one font axis, all in order. We
       call these arrays "variation vectors". They are the simplest and fastest
@@ -940,6 +950,25 @@
             If [VariationVector] is non-zero, it receives the variation vector
             corresponding to the instance. As such, it must be as big as the number of
             variation axes in [Font].
+
+          :kbts_GetGlyphAdvanceX
+          :GetGlyphAdvanceX
+          int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s16 *VariationVectorNormalized)
+            Returns the horizontal advance of glyph [GlyphId] in [Font], in font units, at the
+            variation instance [VariationVectorNormalized]. It is the advance shaping gives
+            the glyph before GPOS adjusts it.
+
+            [VariationVectorNormalized], if it exists, is at least as big as the number of
+            variation axes in [Font]. You can get one from kbts_NormalizeVariationVector. If
+            it is 0, or every coordinate in it is 0, the advance is the default instance's.
+
+            The advance comes from hmtx. When the font has an HVAR table, the HVAR delta is
+            added to it. A variable TrueType font without HVAR keeps its advances in gvar,
+            as the "phantom points" of each glyph; then the advance comes from those, the way
+            HarfBuzz computes it. For this, the blob of such a font also holds its gvar, glyf
+            and loca tables. A font with neither has its hmtx advance at every instance.
+
+            The [return value] is 0 when [Font] is not valid.
 
         DIRECT:SHAPE CONFIG
           :kbts_SizeOfShapeConfig2
@@ -3150,6 +3179,12 @@ enum kbts_blob_table_id_enum
   KBTS_BLOB_TABLE_ID_MVAR,
   KBTS_BLOB_TABLE_ID_HVAR,
   KBTS_BLOB_TABLE_ID_VVAR,
+  // gvar, glyf and loca are kept only for a variable font without HVAR, whose
+  // advances come from gvar's phantom points (kbts__PhantomAdvanceX). They stay in
+  // the font's byte order: kb reads them big-endian, and never swaps them.
+  KBTS_BLOB_TABLE_ID_GVAR,
+  KBTS_BLOB_TABLE_ID_GLYF,
+  KBTS_BLOB_TABLE_ID_LOCA,
 
   KBTS_BLOB_TABLE_ID_COUNT,
 };
@@ -3183,8 +3218,9 @@ enum kbts_blob_version_enum
   KBTS_BLOB_VERSION_INVALID,
   KBTS_BLOB_VERSION_INITIAL,
   KBTS_BLOB_VERSION_REMOVED_SUBTABLE_INFOS_ALIGNED_TABLES,
+  KBTS_BLOB_VERSION_GVAR_GLYF_LOCA, // Three more blob tables, so the header grew.
 
-  KBTS_BLOB_VERSION_CURRENT = KBTS_BLOB_VERSION_REMOVED_SUBTABLE_INFOS_ALIGNED_TABLES,
+  KBTS_BLOB_VERSION_CURRENT = KBTS_BLOB_VERSION_GVAR_GLYF_LOCA,
 };
 
 typedef kbts_u32 kbts_font_style_flags;
@@ -4736,6 +4772,7 @@ KBTS_EXPORT void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info);
 KBTS_EXPORT void kbts_GetFontInfo(kbts_font *Font, kbts_font_info *Info);
 KBTS_EXPORT void kbts_GetVariationInfo(kbts_font *Font, int *AxisCount, int *InstanceCount);
 KBTS_EXPORT void kbts_NormalizeVariationVector(kbts_font *Font, float *VariationVector, kbts_s16 *VariationVectorNormalized);
+KBTS_EXPORT int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s16 *VariationVectorNormalized);
 KBTS_EXPORT int kbts_WindowsIdsForLanguage(kbts_language Language, kbts_windows_language_id *Ids, int IdCapacity);
 KBTS_EXPORT int kbts_LookupFontString(kbts_font *Font, kbts_font_info_string_id StringId, kbts_windows_language_id LanguageId, char *String, int StringCapacity);
 
@@ -18418,6 +18455,1413 @@ static void kbts__EndByteSwapTable(kbts_blob_header *Header, kbts__byteswap_cont
   }
 }
 
+// Advances from gvar phantom points.
+//
+// A variable TrueType font without HVAR keeps its varied advances in gvar: each glyph
+// has four "phantom points" after its own points, and the first two, left and right,
+// are the glyph's horizontal origin and advance. kb computes the advance the way
+// HarfBuzz 14.6.0 does (hb_ot_get_glyph_h_advances in hb-ot-font.cc, which calls
+// glyf's get_advance_with_var_unscaled, Glyph::get_points with only the phantom
+// points asked for, and gvar's apply_deltas_to_points), so the integers are equal:
+//   - left.x = xMin - lsb, right.x = left.x + the hmtx advance, as floats. A glyph that
+//     loca does not place inside glyf is HarfBuzz's empty glyph with id -1: no
+//     header, no hmtx entry, so both are 0 and it has no deltas.
+//   - Each tuple of the glyph's gvar data whose scalar is not 0 adds its deltas for
+//     the phantom points, which are points PointCount to PointCount + 3 (a simple
+//     glyph has last end point + 1 points, a composite one point per component, an
+//     empty glyph none). A tuple that does not list a phantom point gives it no delta:
+//     phantom points are in no contour, so nothing is inferred for them.
+//   - A composite glyph takes the phantom points of a component flagged
+//     USE_MY_METRICS, computed the same way, recursively; the last such component
+//     wins. Other components are not read.
+//   - The advance is round(right.x - left.x), half away from zero, at least 0. kb caps
+//     it at 2^24, as for HVAR advances (kbts__HvarAdvance); HarfBuzz caps it at 2^31.
+//   - HarfBuzz's limits give the same failures: 64 composite levels, 16384 glyphs
+//     visited, a work budget of 2^24, 200000 points, and its cycle check. A glyph that
+//     fails gets unitsPerEm / 2, HarfBuzz's value for it.
+// The float operations follow HarfBuzz's order, because a different order can round
+// a sum ending in .5 the other way.
+//
+// gvar, glyf and loca stay big-endian in the blob and are only read. Every pointer
+// made from a value in them goes through kbts__CheckedOffset with the limits of its own
+// table (or of one glyph's bytes or one glyph's variation data inside it), here and in
+// kbts_PlaceBlob's check (kbts__CheckPhantomTables), which runs this same code over
+// every glyph and drops all three tables when gvar's data is broken.
+
+#define KBTS__GLYF_MAX_NESTING 64 // HB_MAX_NESTING_LEVEL
+#define KBTS__GLYF_MAX_GLYPHS_VISITED 16384 // HB_MAX_GRAPH_EDGE_COUNT
+#define KBTS__GLYF_MAX_POINTS 200000 // HB_GLYF_MAX_POINTS
+#define KBTS__GLYF_BUDGET ((kbts_s64)1 << 24) // HB_BUDGET_GLYPH
+
+// Work kbts__CheckPhantomTables may spend, per byte of gvar and glyf, and per glyph.
+// The point lists of one glyph are read once per tuple, so a small font can ask for
+// far more work than it has bytes. The limit per glyph also bounds what shaping does
+// with the data of one glyph, since shaping reads no more of it than this check did.
+#ifndef KBTS_PHANTOM_OPS_FACTOR
+#  define KBTS_PHANTOM_OPS_FACTOR 64
+#endif
+#define KBTS__PHANTOM_GLYPH_OPS ((kbts_s64)1 << 24)
+
+#define KBTS__GLYF_GLYPH_INVALID 0 // No glyph: an id past the font, or a loca range not inside glyf.
+#define KBTS__GLYF_GLYPH_EMPTY 1
+#define KBTS__GLYF_GLYPH_SIMPLE 2
+#define KBTS__GLYF_GLYPH_COMPOSITE 3
+
+#define KBTS__COMPOSITE_ARG_1_AND_2_ARE_WORDS 0x0001
+#define KBTS__COMPOSITE_WE_HAVE_A_SCALE 0x0008
+#define KBTS__COMPOSITE_MORE_COMPONENTS 0x0020
+#define KBTS__COMPOSITE_WE_HAVE_AN_X_AND_Y_SCALE 0x0040
+#define KBTS__COMPOSITE_WE_HAVE_A_TWO_BY_TWO 0x0080
+#define KBTS__COMPOSITE_USE_MY_METRICS 0x0200
+
+#define KBTS__TUPLE_COUNT_SHARED_POINT_NUMBERS 0x8000
+#define KBTS__TUPLE_COUNT_MASK 0x0FFF
+#define KBTS__TUPLE_EMBEDDED_PEAK_TUPLE 0x8000
+#define KBTS__TUPLE_INTERMEDIATE_REGION 0x4000
+#define KBTS__TUPLE_PRIVATE_POINT_NUMBERS 0x2000
+#define KBTS__TUPLE_INDEX_MASK 0x0FFF
+
+typedef struct kbts__glyf_glyph
+{
+  kbts_u8 *Data; // The glyph's bytes in glyf; 0 for an invalid glyph.
+  kbts_u8 *End;
+  kbts_u32 Kind;
+  kbts_s32 XMin; // 0 when the glyph has no header.
+} kbts__glyf_glyph;
+
+typedef struct kbts__phantom_context
+{
+  kbts_u8 *Gvar;
+  kbts_u8 *GvarEnd;
+  kbts_u8 *Glyf;
+  kbts_u8 *GlyfEnd;
+  kbts_u8 *Loca;
+  kbts_u8 *LocaEnd;
+  kbts_b32 LocaIsShort;
+
+  // maxp's glyph count. HarfBuzz's glyf, gvar and hmtx all count glyphs with it.
+  kbts_un GlyphCount;
+
+  kbts_un GvarAxisCount;
+  kbts_u8 *SharedTuples;
+  kbts_un SharedTupleCount;
+  kbts_u8 *GlyphVariationDataOffsets;
+  kbts_b32 LongOffsets;
+  kbts_u8 *GlyphVariationData; // gvar's data array; each glyph's data is an offset from it.
+
+  // hmtx as HarfBuzz reads it (hmtxvmtx::accelerator_t).
+  kbts__long_mtx *LongMetrics;
+  kbts_s16 *Bearings;
+  kbts_un LongMetricCount;
+  kbts_un BearingCount;
+  kbts_s32 FailedAdvance; // unitsPerEm / 2, with HarfBuzz's 1000 for a unitsPerEm outside [16, 16384].
+
+  // The instance, or 0 in kbts__CheckPhantomTables.
+  kbts_s16 *VariationVectorNormalized;
+  kbts_un FvarAxisCount;
+
+  // HarfBuzz's limits, for one advance.
+  kbts_s64 Budget;
+  kbts_un GlyphsVisited;
+  kbts_un PointCount; // The length of HarfBuzz's all_points vector.
+  kbts_un ComponentIds[KBTS__GLYF_MAX_NESTING + 1]; // The component each composite level is in.
+
+  // kbts__CheckPhantomTables: work left for the font and for the glyph being checked.
+  kbts_s64 CheckWorkLeft;
+  kbts_s64 GlyphWorkLeft;
+} kbts__phantom_context;
+
+static kbts_un kbts__ReadBigU16(kbts_u8 *At)
+{
+  kbts_un Result = ((kbts_un)At[0] << 8) | At[1];
+  return Result;
+}
+
+static kbts_s32 kbts__ReadBigS16(kbts_u8 *At)
+{
+  kbts_s32 Result = (kbts_s16)kbts__ReadBigU16(At);
+  return Result;
+}
+
+static kbts_u32 kbts__ReadBigU32(kbts_u8 *At)
+{
+  kbts_u32 Result = ((kbts_u32)At[0] << 24) | ((kbts_u32)At[1] << 16) | ((kbts_u32)At[2] << 8) | At[3];
+  return Result;
+}
+
+// roundf: a value halfway between two integers rounds away from zero. kbts__Round32
+// does not do this (its SSE2 form rounds half to even). |X| >= 2^23 is an integer already.
+static float kbts__RoundHalfAwayFromZero(float X)
+{
+  float Result = X;
+
+  if((X > -8388608.0f) && (X < 8388608.0f))
+  {
+    float Truncated = (float)(kbts_s32)X;
+    float Fraction = X - Truncated;
+
+    Result = Truncated;
+    if(Fraction >= 0.5f)
+    {
+      Result += 1.0f;
+    }
+    else if(Fraction <= -0.5f)
+    {
+      Result -= 1.0f;
+    }
+  }
+
+  return Result;
+}
+
+// The glyph GlyphId of glyf, through loca (glyf_accelerator_t::glyph_for_gid). A glyph
+// shorter than its 10-byte header is empty, as is one with 0 contours; HarfBuzz reads
+// a negative contour count as composite.
+static kbts__glyf_glyph kbts__GlyfGlyph(kbts__phantom_context *Context, kbts_un GlyphId)
+{
+  kbts__glyf_glyph Result = KBTS__ZERO;
+
+  if(GlyphId < Context->GlyphCount)
+  {
+    // kbts__BeginPhantomAdvances proved that loca holds GlyphCount + 1 entries, so this
+    // check cannot fail; it is here because GlyphId is a value from the font.
+    kbts_un EntrySize = Context->LocaIsShort ? 2 : 4;
+    kbts_u8 *Entry = (kbts_u8 *)kbts__CheckedOffset(Context->Loca, kbts__ArraySize(GlyphId, EntrySize), 2 * EntrySize, (char *)Context->Loca, (char *)Context->LocaEnd);
+
+    if(Entry)
+    {
+      kbts_un Start = Context->LocaIsShort ? 2 * kbts__ReadBigU16(Entry) : kbts__ReadBigU32(Entry);
+      kbts_un End = Context->LocaIsShort ? 2 * kbts__ReadBigU16(Entry + 2) : kbts__ReadBigU32(Entry + 4);
+      // A range that runs backwards has a size that wraps, which no table holds.
+      kbts_u8 *Data = (kbts_u8 *)kbts__CheckedOffset(Context->Glyf, Start, End - Start, (char *)Context->Glyf, (char *)Context->GlyfEnd);
+
+      if(Data)
+      {
+        Result.Data = Data;
+        Result.End = Data + (End - Start);
+        Result.Kind = KBTS__GLYF_GLYPH_EMPTY;
+
+        if(kbts__CheckedOffset(Data, 0, 10, (char *)Data, (char *)Result.End))
+        {
+          kbts_s32 ContourCount = kbts__ReadBigS16(Data);
+
+          Result.XMin = kbts__ReadBigS16(Data + 2);
+          if(ContourCount > 0)
+          {
+            Result.Kind = KBTS__GLYF_GLYPH_SIMPLE;
+          }
+          else if(ContourCount < 0)
+          {
+            Result.Kind = KBTS__GLYF_GLYPH_COMPOSITE;
+          }
+        }
+      }
+    }
+  }
+
+  return Result;
+}
+
+// The size of the composite record at Offset in Glyph, or 0 when it does not fit, where
+// HarfBuzz's composite iterator stops.
+static kbts_un kbts__CompositeRecordSize(kbts__glyf_glyph *Glyph, kbts_un Offset)
+{
+  kbts_un Result = 0;
+  kbts_u8 *Record = (kbts_u8 *)kbts__CheckedOffset(Glyph->Data, Offset, 4, (char *)Glyph->Data, (char *)Glyph->End);
+
+  if(Record)
+  {
+    kbts_un Flags = kbts__ReadBigU16(Record);
+    kbts_un Size = 4 + ((Flags & KBTS__COMPOSITE_ARG_1_AND_2_ARE_WORDS) ? 4 : 2);
+
+    if(Flags & KBTS__COMPOSITE_WE_HAVE_A_SCALE)
+    {
+      Size += 2;
+    }
+    else if(Flags & KBTS__COMPOSITE_WE_HAVE_AN_X_AND_Y_SCALE)
+    {
+      Size += 4;
+    }
+    else if(Flags & KBTS__COMPOSITE_WE_HAVE_A_TWO_BY_TWO)
+    {
+      Size += 8;
+    }
+
+    if(kbts__CheckedOffset(Record, 0, Size, (char *)Glyph->Data, (char *)Glyph->End))
+    {
+      Result = Size;
+    }
+  }
+
+  return Result;
+}
+
+// The number of points of a simple glyph (SimpleGlyph::get_contour_points): its last end
+// point + 1. 0 when HarfBuzz fails the glyph: the end points and the instruction length
+// after them must fit, and there must be at least one point per contour.
+static kbts_un kbts__SimpleGlyphPointCount(kbts__glyf_glyph *Glyph)
+{
+  kbts_un Result = 0;
+  kbts_un ContourCount = (kbts_un)kbts__ReadBigS16(Glyph->Data);
+  kbts_u8 *EndPoints = (kbts_u8 *)kbts__CheckedOffset(Glyph->Data, 10, (ContourCount + 1) * 2, (char *)Glyph->Data, (char *)Glyph->End);
+
+  if(EndPoints)
+  {
+    kbts_un PointCount = kbts__ReadBigU16(EndPoints + (ContourCount - 1) * 2) + 1;
+
+    if(PointCount >= ContourCount)
+    {
+      Result = PointCount;
+    }
+  }
+
+  return Result;
+}
+
+static kbts_un kbts__CompositeGlyphPointCount(kbts__glyf_glyph *Glyph)
+{
+  kbts_un Result = 0;
+  kbts_un Offset = 10;
+  kbts_un Size;
+
+  while((Size = kbts__CompositeRecordSize(Glyph, Offset)) != 0)
+  {
+    Result += 1;
+
+    if(!(kbts__ReadBigU16(Glyph->Data + Offset) & KBTS__COMPOSITE_MORE_COMPONENTS))
+    {
+      break;
+    }
+
+    Offset += Size;
+  }
+
+  return Result;
+}
+
+// A stream of packed deltas (gvar "packed deltas", HarfBuzz's TupleValues::decompile)
+// that must hold exactly Count values. Each run is checked whole when it starts, as
+// HarfBuzz checks it: a run that goes past Count, or whose values go past End, is an
+// error. Skipping costs one step per run.
+typedef struct kbts__packed_deltas
+{
+  kbts_u8 *At;
+  kbts_u8 *End;
+  kbts_un Count;
+  kbts_un Index;
+  kbts_un RunEnd;
+  kbts_un ValueSize; // 0 for a run of zeros.
+  kbts_b32 Error;
+} kbts__packed_deltas;
+
+static kbts__packed_deltas kbts__PackedDeltas(kbts_u8 *At, kbts_u8 *End, kbts_un Count)
+{
+  kbts__packed_deltas Result = KBTS__ZERO;
+  Result.At = At;
+  Result.End = End;
+  Result.Count = Count;
+  return Result;
+}
+
+static void kbts__BeginPackedDeltaRun(kbts__packed_deltas *Deltas)
+{
+  if(Deltas->At < Deltas->End)
+  {
+    kbts_un Control = *Deltas->At++;
+    kbts_un RunCount = (Control & 0x3F) + 1;
+    kbts_un ValueSize = 1;
+
+    switch(Control & 0xC0)
+    {
+    case 0x80: ValueSize = 0; break;
+    case 0x40: ValueSize = 2; break;
+    case 0xC0: ValueSize = 4; break;
+    }
+
+    if((RunCount <= (Deltas->Count - Deltas->Index)) &&
+       kbts__CheckedOffset(Deltas->At, 0, RunCount * ValueSize, (char *)Deltas->At, (char *)Deltas->End))
+    {
+      Deltas->RunEnd = Deltas->Index + RunCount;
+      Deltas->ValueSize = ValueSize;
+    }
+    else
+    {
+      Deltas->Error = 1;
+    }
+  }
+  else
+  {
+    Deltas->Error = 1;
+  }
+}
+
+// Skips SkipCount values; Index + SkipCount <= Count.
+static void kbts__SkipPackedDeltas(kbts__packed_deltas *Deltas, kbts_un SkipCount)
+{
+  while(SkipCount && !Deltas->Error)
+  {
+    if(Deltas->Index == Deltas->RunEnd)
+    {
+      kbts__BeginPackedDeltaRun(Deltas);
+    }
+
+    if(!Deltas->Error)
+    {
+      kbts_un Step = KBTS__MIN(SkipCount, Deltas->RunEnd - Deltas->Index);
+      Deltas->At += Step * Deltas->ValueSize;
+      Deltas->Index += Step;
+      SkipCount -= Step;
+    }
+  }
+}
+
+// The next value; Index < Count.
+static kbts_s32 kbts__NextPackedDelta(kbts__packed_deltas *Deltas)
+{
+  kbts_s32 Result = 0;
+
+  if(Deltas->Index == Deltas->RunEnd)
+  {
+    kbts__BeginPackedDeltaRun(Deltas);
+  }
+
+  if(!Deltas->Error)
+  {
+    switch(Deltas->ValueSize)
+    {
+    case 1: Result = (kbts_s8)Deltas->At[0]; break;
+    case 2: Result = kbts__ReadBigS16(Deltas->At); break;
+    case 4: Result = (kbts_s32)kbts__ReadBigU32(Deltas->At); break;
+    }
+
+    Deltas->At += Deltas->ValueSize;
+    Deltas->Index += 1;
+  }
+
+  return Result;
+}
+
+// A list of packed point numbers (gvar "packed point numbers", HarfBuzz's
+// decompile_points): a count, then runs of increments. A count of 0 means every point.
+// Each run is checked whole when it starts. The numbers never decrease.
+typedef struct kbts__packed_points
+{
+  kbts_u8 *At;
+  kbts_u8 *End;
+  kbts_un Count;
+  kbts_un Index;
+  kbts_un RunEnd;
+  kbts_un ValueSize;
+  kbts_un Point;
+  kbts_b32 Error;
+} kbts__packed_points;
+
+static kbts__packed_points kbts__PackedPoints(kbts_u8 *At, kbts_u8 *End)
+{
+  kbts__packed_points Result = KBTS__ZERO;
+  Result.At = At;
+  Result.End = End;
+
+  if(Result.At < Result.End)
+  {
+    Result.Count = *Result.At++;
+
+    if(Result.Count & 0x80)
+    {
+      if(Result.At < Result.End)
+      {
+        Result.Count = ((Result.Count & 0x7F) << 8) | *Result.At++;
+      }
+      else
+      {
+        Result.Error = 1;
+      }
+    }
+  }
+  else
+  {
+    Result.Error = 1;
+  }
+
+  return Result;
+}
+
+static void kbts__BeginPackedPointRun(kbts__packed_points *Points)
+{
+  if(Points->At < Points->End)
+  {
+    kbts_un Control = *Points->At++;
+    kbts_un RunCount = (Control & 0x7F) + 1;
+    kbts_un ValueSize = (Control & 0x80) ? 2 : 1;
+
+    if((RunCount <= (Points->Count - Points->Index)) &&
+       kbts__CheckedOffset(Points->At, 0, RunCount * ValueSize, (char *)Points->At, (char *)Points->End))
+    {
+      Points->RunEnd = Points->Index + RunCount;
+      Points->ValueSize = ValueSize;
+    }
+    else
+    {
+      Points->Error = 1;
+    }
+  }
+  else
+  {
+    Points->Error = 1;
+  }
+}
+
+// The next point number; Index < Count.
+static kbts_un kbts__NextPackedPoint(kbts__packed_points *Points)
+{
+  if(Points->Index == Points->RunEnd)
+  {
+    kbts__BeginPackedPointRun(Points);
+  }
+
+  if(!Points->Error)
+  {
+    Points->Point += (Points->ValueSize == 2) ? kbts__ReadBigU16(Points->At) : Points->At[0];
+    Points->At += Points->ValueSize;
+    Points->Index += 1;
+  }
+
+  return Points->Point;
+}
+
+// Skips the whole list, one step per run, to find where it ends.
+static void kbts__SkipPackedPoints(kbts__packed_points *Points)
+{
+  while((Points->Index < Points->Count) && !Points->Error)
+  {
+    kbts__BeginPackedPointRun(Points);
+
+    if(!Points->Error)
+    {
+      Points->At += (Points->RunEnd - Points->Index) * Points->ValueSize;
+      Points->Index = Points->RunEnd;
+    }
+  }
+}
+
+// The tuples of one glyph's variation data, as HarfBuzz's tuple_iterator_t walks them.
+typedef struct kbts__tuple_iterator
+{
+  kbts_u8 *Data; // The glyph's variation data.
+  kbts_u8 *End;
+  kbts_un SerializedDataOffset; // From Data to the shared points, then each tuple's data.
+  kbts_un TuplesLeft;
+  kbts_un AxisCount;
+  kbts_u8 *Tuple; // The current tuple variation header.
+  kbts_un TupleSize;
+  kbts_un DataOffset; // From SerializedData to the current tuple's data.
+} kbts__tuple_iterator;
+
+// Whether the current tuple's header fits (is_valid). When it does not, the walk ends
+// there, without an error, as in HarfBuzz.
+static int kbts__TupleIsValid(kbts__tuple_iterator *It)
+{
+  int Result = 0;
+
+  if(It->TuplesLeft && kbts__CheckedOffset(It->Tuple, 0, 4, (char *)It->Data, (char *)It->End))
+  {
+    kbts_un TupleIndex = kbts__ReadBigU16(It->Tuple + 2);
+    kbts_un TupleCount = ((TupleIndex & KBTS__TUPLE_EMBEDDED_PEAK_TUPLE) ? 1 : 0) + ((TupleIndex & KBTS__TUPLE_INTERMEDIATE_REGION) ? 2 : 0);
+
+    It->TupleSize = 4 + TupleCount * It->AxisCount * 2;
+    Result = kbts__CheckedOffset(It->Tuple, 0, It->TupleSize, (char *)It->Data, (char *)It->End) != 0;
+  }
+
+  return Result;
+}
+
+static int kbts__NextTuple(kbts__tuple_iterator *It)
+{
+  It->DataOffset += kbts__ReadBigU16(It->Tuple);
+  It->Tuple += It->TupleSize;
+  It->TuplesLeft -= 1;
+  int Result = kbts__TupleIsValid(It);
+  return Result;
+}
+
+// The scalar of a tuple at the instance (TupleVariationHeader::calculate_scalar), in
+// double as in HarfBuzz. A coordinate past the instance's axes is 0, as HarfBuzz reads
+// coordinates past font->num_coords.
+static double kbts__TupleScalar(kbts__phantom_context *Context, kbts_u8 *Tuple)
+{
+  kbts_un TupleIndex = kbts__ReadBigU16(Tuple + 2);
+  kbts_un AxisCount = Context->GvarAxisCount;
+  kbts_u8 *Peak = Tuple + 4;
+  kbts_u8 *Start = 0;
+  kbts_u8 *End = 0;
+  double Result = 1.0;
+
+  if(!(TupleIndex & KBTS__TUPLE_EMBEDDED_PEAK_TUPLE))
+  {
+    kbts_un SharedIndex = TupleIndex & KBTS__TUPLE_INDEX_MASK;
+
+    // kbts__BeginPhantomAdvances checked that the shared tuples fit.
+    if((SharedIndex + 1) * AxisCount > Context->SharedTupleCount * AxisCount)
+    {
+      return 0.0;
+    }
+
+    Peak = Context->SharedTuples + SharedIndex * AxisCount * 2;
+  }
+
+  if(TupleIndex & KBTS__TUPLE_INTERMEDIATE_REGION)
+  {
+    Start = Tuple + 4 + ((TupleIndex & KBTS__TUPLE_EMBEDDED_PEAK_TUPLE) ? AxisCount * 2 : 0);
+    End = Start + AxisCount * 2;
+  }
+
+  KBTS__FOR(AxisIndex, 0, AxisCount)
+  {
+    kbts_s32 PeakValue = kbts__ReadBigS16(Peak + AxisIndex * 2);
+
+    if(!PeakValue)
+    {
+      continue;
+    }
+
+    kbts_s32 Value = (AxisIndex < Context->FvarAxisCount) ? Context->VariationVectorNormalized[AxisIndex] : 0;
+
+    if(!Value)
+    {
+      Result = 0.0;
+      break;
+    }
+
+    if(Value == PeakValue)
+    {
+      continue;
+    }
+
+    if(Start)
+    {
+      kbts_s32 StartValue = kbts__ReadBigS16(Start + AxisIndex * 2);
+      kbts_s32 EndValue = kbts__ReadBigS16(End + AxisIndex * 2);
+
+      // A region that does not hold its peak, or that crosses 0, does not limit this axis.
+      if((StartValue > PeakValue) || (PeakValue > EndValue) || ((StartValue < 0) && (EndValue > 0)))
+      {
+        continue;
+      }
+
+      if((Value < StartValue) || (Value > EndValue))
+      {
+        Result = 0.0;
+        break;
+      }
+
+      if(Value < PeakValue)
+      {
+        if(PeakValue != StartValue)
+        {
+          Result *= (double)(Value - StartValue) / (PeakValue - StartValue);
+        }
+      }
+      else
+      {
+        if(PeakValue != EndValue)
+        {
+          Result *= (double)(EndValue - Value) / (EndValue - PeakValue);
+        }
+      }
+    }
+    else if((Value < KBTS__MIN(0, PeakValue)) || (Value > KBTS__MAX(0, PeakValue)))
+    {
+      Result = 0.0;
+      break;
+    }
+    else
+    {
+      Result *= (double)Value / PeakValue;
+    }
+  }
+
+  return Result;
+}
+
+static int kbts__SpendPhantomBudget(kbts__phantom_context *Context, kbts_un Cost)
+{
+  Context->Budget -= (kbts_s64)Cost;
+  int Result = Context->Budget >= 0;
+  return Result;
+}
+
+static int kbts__SpendPhantomCheckWork(kbts__phantom_context *Context, kbts_un Cost)
+{
+  Context->CheckWorkLeft -= (kbts_s64)Cost;
+  Context->GlyphWorkLeft -= (kbts_s64)Cost;
+  int Result = (Context->CheckWorkLeft >= 0) && (Context->GlyphWorkLeft >= 0);
+  return Result;
+}
+
+// The variation data of glyph GlyphId, a glyph of PointCount points, applied to its left
+// and right phantom points, Phantoms[0] and Phantoms[1] (apply_deltas_to_points).
+// ChargeFour is HarfBuzz's phantom_only for a simple glyph, which charges 4 per tuple to
+// the budget instead of PointCount + 4.
+// Without a variation vector (kbts__CheckPhantomTables), every tuple is read and none is
+// applied, and the work is charged to the check's limits instead.
+// Returns 0 where HarfBuzz returns false. A glyph with no data, or whose shared points or
+// first tuple header do not fit, has no deltas, as in HarfBuzz.
+static int kbts__ApplyPhantomDeltas(kbts__phantom_context *Context, kbts_un GlyphId, kbts_un PointCount, kbts_b32 ChargeFour, float *Phantoms)
+{
+  kbts_b32 Checking = !Context->VariationVectorNormalized;
+  kbts__tuple_iterator It = KBTS__ZERO;
+  kbts_u8 *SharedPoints = 0;
+
+  if(GlyphId >= Context->GlyphCount)
+  {
+    return 1;
+  }
+
+  {
+    // Like loca's entries, these were proved to fit (kbts__BeginPhantomAdvances).
+    kbts_un EntrySize = Context->LongOffsets ? 4 : 2;
+    kbts_u8 *Entry = (kbts_u8 *)kbts__CheckedOffset(Context->GlyphVariationDataOffsets, kbts__ArraySize(GlyphId, EntrySize), 2 * EntrySize, (char *)Context->Gvar, (char *)Context->GvarEnd);
+    kbts_un Start = 0;
+    kbts_un End = 0;
+
+    if(Entry)
+    {
+      Start = Context->LongOffsets ? kbts__ReadBigU32(Entry) : 2 * kbts__ReadBigU16(Entry);
+      End = Context->LongOffsets ? kbts__ReadBigU32(Entry + 4) : 2 * kbts__ReadBigU16(Entry + 2);
+    }
+
+    // Offsets that run backwards, or data shorter than its 4-byte header, are no data.
+    if((End < Start) || ((End - Start) < 4))
+    {
+      return 1;
+    }
+
+    // Data past the end of gvar is broken; HarfBuzz would read the part that fits.
+    It.Data = (kbts_u8 *)kbts__CheckedOffset(Context->GlyphVariationData, Start, End - Start, (char *)Context->Gvar, (char *)Context->GvarEnd);
+    if(!It.Data)
+    {
+      return 0;
+    }
+    It.End = It.Data + (End - Start);
+  }
+
+  kbts_un TupleVariationCount = kbts__ReadBigU16(It.Data);
+  It.TuplesLeft = TupleVariationCount & KBTS__TUPLE_COUNT_MASK;
+  It.AxisCount = Context->GvarAxisCount;
+  It.Tuple = It.Data + 4;
+  It.SerializedDataOffset = kbts__ReadBigU16(It.Data + 2);
+
+  if(!It.TuplesLeft)
+  {
+    return 1;
+  }
+
+  // Shared points that cannot be read leave the glyph without deltas, as in HarfBuzz.
+  if(TupleVariationCount & KBTS__TUPLE_COUNT_SHARED_POINT_NUMBERS)
+  {
+    kbts_u8 *At = (kbts_u8 *)kbts__CheckedOffset(It.Data, It.SerializedDataOffset, 0, (char *)It.Data, (char *)It.End);
+
+    if(!At)
+    {
+      return 1;
+    }
+
+    kbts__packed_points Shared = kbts__PackedPoints(At, It.End);
+    kbts__SkipPackedPoints(&Shared);
+
+    if(Shared.Error)
+    {
+      return 1;
+    }
+
+    if(Checking && !kbts__SpendPhantomCheckWork(Context, Shared.Count))
+    {
+      return 0;
+    }
+
+    SharedPoints = At;
+    It.DataOffset = (kbts_un)(Shared.At - At);
+  }
+
+  if(!kbts__TupleIsValid(&It))
+  {
+    return 1;
+  }
+
+  float Deltas[2] = {0, 0};
+  kbts_b32 Flush = 0;
+  kbts_b32 PrivatePointsChecked = 0;
+  kbts_b32 AnyPrivatePoints = 0;
+
+  do
+  {
+    float Scalar = 0;
+
+    if(Checking)
+    {
+      if(!kbts__SpendPhantomCheckWork(Context, 1))
+      {
+        return 0;
+      }
+    }
+    else
+    {
+      Scalar = (float)kbts__TupleScalar(Context, It.Tuple);
+
+      if(Scalar == 0.0f)
+      {
+        continue;
+      }
+
+      if(!kbts__SpendPhantomBudget(Context, ChargeFour ? 4 : PointCount + 4))
+      {
+        return 0;
+      }
+
+      // HarfBuzz looks for private points from the first tuple that applies on.
+      if(!PrivatePointsChecked)
+      {
+        kbts__tuple_iterator Scan = It;
+
+        do
+        {
+          if(kbts__ReadBigU16(Scan.Tuple + 2) & KBTS__TUPLE_PRIVATE_POINT_NUMBERS)
+          {
+            AnyPrivatePoints = 1;
+            break;
+          }
+        } while(kbts__NextTuple(&Scan));
+
+        PrivatePointsChecked = 1;
+      }
+    }
+
+    kbts_un TupleDataSize = kbts__ReadBigU16(It.Tuple);
+    kbts_u8 *SerializedData = (kbts_u8 *)kbts__CheckedOffset(It.Data, It.SerializedDataOffset, 0, (char *)It.Data, (char *)It.End);
+    kbts_u8 *TupleData = (kbts_u8 *)kbts__CheckedOffset(SerializedData, It.DataOffset, TupleDataSize, (char *)It.Data, (char *)It.End);
+
+    if(!TupleData)
+    {
+      return 0;
+    }
+
+    kbts_u8 *TupleDataEnd = TupleData + TupleDataSize;
+    kbts__packed_points Points = KBTS__ZERO;
+
+    if(kbts__ReadBigU16(It.Tuple + 2) & KBTS__TUPLE_PRIVATE_POINT_NUMBERS)
+    {
+      // The deltas follow the private points; the points are read again with them.
+      Points = kbts__PackedPoints(TupleData, TupleDataEnd);
+      kbts__SkipPackedPoints(&Points);
+
+      if(Points.Error)
+      {
+        return 0;
+      }
+
+      kbts_u8 *PointData = TupleData;
+      TupleData = Points.At;
+      Points = kbts__PackedPoints(PointData, TupleDataEnd);
+    }
+    else if(SharedPoints)
+    {
+      Points = kbts__PackedPoints(SharedPoints, It.End);
+    }
+
+    kbts_b32 ApplyToAll = !Points.Count;
+    kbts_un DeltaCount = ApplyToAll ? PointCount + 4 : Points.Count;
+    kbts__packed_deltas XDeltas = kbts__PackedDeltas(TupleData, TupleDataEnd, DeltaCount);
+
+    if(Checking)
+    {
+      kbts__SkipPackedDeltas(&XDeltas, DeltaCount);
+      kbts__packed_deltas YDeltas = kbts__PackedDeltas(XDeltas.At, TupleDataEnd, DeltaCount);
+      kbts__SkipPackedDeltas(&YDeltas, DeltaCount);
+
+      // Shaping reads each point number of a tuple once.
+      if(XDeltas.Error || YDeltas.Error || !kbts__SpendPhantomCheckWork(Context, ApplyToAll ? 0 : Points.Count))
+      {
+        return 0;
+      }
+    }
+    else if(ApplyToAll && !AnyPrivatePoints)
+    {
+      // HarfBuzz adds these deltas to the points directly, tuple by tuple.
+      kbts__SkipPackedDeltas(&XDeltas, PointCount);
+      Phantoms[0] += (float)kbts__NextPackedDelta(&XDeltas) * Scalar;
+      Phantoms[1] += (float)kbts__NextPackedDelta(&XDeltas) * Scalar;
+
+      if(XDeltas.Error)
+      {
+        return 0;
+      }
+    }
+    else
+    {
+      // HarfBuzz sums these in a delta per point, and adds the sums to the points before
+      // a tuple with its own point list and at the end.
+      if(!ApplyToAll)
+      {
+        if(Flush)
+        {
+          Phantoms[0] += Deltas[0];
+          Phantoms[1] += Deltas[1];
+        }
+
+        Deltas[0] = 0;
+        Deltas[1] = 0;
+      }
+
+      if(ApplyToAll)
+      {
+        kbts__SkipPackedDeltas(&XDeltas, PointCount);
+        Deltas[0] += (float)kbts__NextPackedDelta(&XDeltas) * Scalar;
+        Deltas[1] += (float)kbts__NextPackedDelta(&XDeltas) * Scalar;
+      }
+      else
+      {
+        // A point number can repeat; each one adds its delta.
+        KBTS__FOR(DeltaIndex, 0, DeltaCount)
+        {
+          kbts_un Point = kbts__NextPackedPoint(&Points);
+
+          if(Points.Error || (Point > PointCount + 1))
+          {
+            break;
+          }
+
+          if(Point >= PointCount)
+          {
+            kbts__SkipPackedDeltas(&XDeltas, DeltaIndex - XDeltas.Index);
+            Deltas[Point - PointCount] += (float)kbts__NextPackedDelta(&XDeltas) * Scalar;
+          }
+        }
+      }
+
+      if(Points.Error || XDeltas.Error)
+      {
+        return 0;
+      }
+
+      Flush = 1;
+    }
+  } while(kbts__NextTuple(&It));
+
+  if(Flush)
+  {
+    Phantoms[0] += Deltas[0];
+    Phantoms[1] += Deltas[1];
+  }
+
+  return 1;
+}
+
+// hmtx as HarfBuzz reads it for the phantom points: an id past the bearings has
+// advance and side bearing 0.
+static void kbts__PhantomHmtx(kbts__phantom_context *Context, kbts_un GlyphId, kbts_s32 *Advance, kbts_s32 *SideBearing)
+{
+  *Advance = 0;
+  *SideBearing = 0;
+
+  if(GlyphId < Context->BearingCount)
+  {
+    *Advance = Context->LongMetrics[KBTS__MIN(GlyphId, Context->LongMetricCount - 1)].Advance;
+
+    if(GlyphId < Context->LongMetricCount)
+    {
+      *SideBearing = Context->LongMetrics[GlyphId].PreviousSideBearing;
+    }
+    else
+    {
+      *SideBearing = kbts__ReadS16Unaligned(&Context->Bearings[GlyphId - Context->LongMetricCount]);
+    }
+  }
+}
+
+// The left and right phantom points of glyph GlyphId at composite level Depth
+// (Glyph::get_points, with only the phantom points asked for). Returns 0 where HarfBuzz
+// returns false. Context->PointCount follows the length of HarfBuzz's all_points: a
+// composite takes a component's phantom points from the end of it, and HarfBuzz
+// shortens it by 4 after every component, also one it did not read, so a component
+// whose points were shortened away gives 0 for a phantom point.
+static int kbts__GlyphPhantoms(kbts__phantom_context *Context, kbts_un GlyphId, kbts_un Depth, float *Phantoms)
+{
+  int Result = 0;
+
+  if((Depth <= KBTS__GLYF_MAX_NESTING) &&
+     (Context->GlyphsVisited <= KBTS__GLYF_MAX_GLYPHS_VISITED))
+  {
+    Context->GlyphsVisited += 1;
+
+    if(kbts__SpendPhantomBudget(Context, 16))
+    {
+      kbts__glyf_glyph Glyph = kbts__GlyfGlyph(Context, GlyphId);
+      kbts_un PointCount = 0;
+
+      Result = 1;
+      if(Glyph.Kind == KBTS__GLYF_GLYPH_SIMPLE)
+      {
+        PointCount = kbts__SimpleGlyphPointCount(&Glyph);
+        Result = PointCount && kbts__SpendPhantomBudget(Context, PointCount);
+        Context->PointCount += PointCount;
+      }
+      else if(Glyph.Kind == KBTS__GLYF_GLYPH_COMPOSITE)
+      {
+        PointCount = kbts__CompositeGlyphPointCount(&Glyph);
+      }
+
+      if(Result)
+      {
+        // HarfBuzz's invalid glyph has id -1: no hmtx entry and no variation data.
+        kbts_un PhantomGlyphId = (Glyph.Kind == KBTS__GLYF_GLYPH_INVALID) ? (kbts_un)-1 : GlyphId;
+        kbts_s32 Advance, SideBearing;
+        kbts__PhantomHmtx(Context, PhantomGlyphId, &Advance, &SideBearing);
+
+        kbts_s32 Left = Glyph.XMin - SideBearing;
+        Phantoms[0] = (float)Left;
+        Phantoms[1] = (float)(Advance + Left);
+
+        Result = kbts__ApplyPhantomDeltas(Context, PhantomGlyphId, PointCount, Glyph.Kind == KBTS__GLYF_GLYPH_SIMPLE, Phantoms);
+      }
+
+      if(Result && (Glyph.Kind == KBTS__GLYF_GLYPH_COMPOSITE))
+      {
+        kbts_un Offset = 10;
+        kbts_un Size;
+
+        while((Size = kbts__CompositeRecordSize(&Glyph, Offset)) != 0)
+        {
+          kbts_un Flags = kbts__ReadBigU16(Glyph.Data + Offset);
+          kbts_un ComponentId = kbts__ReadBigU16(Glyph.Data + Offset + 2);
+
+          // HarfBuzz's cycle check (hb_decycler_t) compares a component with the one that
+          // the composite level halfway up the path is in, and skips it when they are equal.
+          Context->ComponentIds[Depth] = ComponentId;
+          if(!Depth || (Context->ComponentIds[Depth / 2] != ComponentId))
+          {
+            kbts_un OldPointCount = Context->PointCount;
+
+            if(Flags & KBTS__COMPOSITE_USE_MY_METRICS)
+            {
+              float ComponentPhantoms[2];
+
+              if(!kbts__GlyphPhantoms(Context, ComponentId, Depth + 1, ComponentPhantoms))
+              {
+                Result = 0;
+                break;
+              }
+
+              // The component's phantom points are the last 4 of all_points. HarfBuzz reads
+              // them at the end of what the component added, so when it added fewer than 4,
+              // the first ones fall before that and read as 0.
+              kbts_un Added = (Context->PointCount > OldPointCount) ? Context->PointCount - OldPointCount : 0;
+              Phantoms[0] = (Added >= 4) ? ComponentPhantoms[0] : 0.0f;
+              Phantoms[1] = (Added >= 3) ? ComponentPhantoms[1] : 0.0f;
+
+              if(!kbts__SpendPhantomBudget(Context, Added))
+              {
+                Result = 0;
+                break;
+              }
+            }
+
+            // all_points.resize(length - 4), which does nothing when that is negative.
+            if(Context->PointCount >= 4)
+            {
+              Context->PointCount -= 4;
+            }
+
+            if(Context->PointCount > KBTS__GLYF_MAX_POINTS)
+            {
+              Result = 0;
+              break;
+            }
+          }
+
+          if(!(Flags & KBTS__COMPOSITE_MORE_COMPONENTS))
+          {
+            break;
+          }
+
+          Offset += Size;
+        }
+      }
+
+      if(Result)
+      {
+        // The phantom points go at the end of all_points.
+        Context->PointCount += 4;
+      }
+    }
+  }
+
+  return Result;
+}
+
+// The advance of glyph GlyphId at the context's instance
+// (glyf_accelerator_t::get_advance_with_var_unscaled).
+static kbts_s32 kbts__PhantomAdvanceX(kbts__phantom_context *Context, kbts_un GlyphId)
+{
+  kbts_s32 Result = 0;
+
+  if(GlyphId < Context->GlyphCount)
+  {
+    float Phantoms[2];
+
+    Context->Budget = KBTS__GLYF_BUDGET;
+    Context->GlyphsVisited = 0;
+    Context->PointCount = 0;
+
+    if(kbts__GlyphPhantoms(Context, GlyphId, 0, Phantoms) &&
+       kbts__SpendPhantomBudget(Context, Context->PointCount))
+    {
+      float Advance = kbts__RoundHalfAwayFromZero(Phantoms[1] - Phantoms[0]);
+
+      if(Advance >= (float)(1 << 24))
+      {
+        Result = 1 << 24;
+      }
+      else if(Advance > 0)
+      {
+        Result = (kbts_s32)Advance;
+      }
+    }
+    else
+    {
+      Result = Context->FailedAdvance;
+    }
+  }
+
+  return Result;
+}
+
+// Points Context at Header's gvar, glyf, loca, hmtx and the instance. Returns 0 when
+// the blob has no phantom-point advances: kbts_LoadFont did not keep gvar, glyf and loca
+// (the font has HVAR) or kbts_PlaceBlob dropped them, or there is no head, hhea, hmtx or
+// fvar. With a vector, also 0 at the default instance, where HarfBuzz reads hmtx alone.
+// The checks here are the table-level ones, O(1), and they run again on every call, so
+// nothing below reads a header that was not checked in the same call:
+//   - head's loca format and glyph data format are 0 or 1 (HarfBuzz's glyf accepts no
+//     other, and then uses hmtx, as kb does), and loca has maxp's glyph count + 1
+//     entries (HarfBuzz gives the glyphs past loca an advance of 0).
+//   - gvar's major version is 1, and its header, shared tuples and glyph offsets fit
+//     (HarfBuzz's sanitizer), and its data array starts inside it.
+static int kbts__BeginPhantomAdvances(kbts__phantom_context *Context, kbts_blob_header *Header, kbts_s16 *VariationVectorNormalized)
+{
+  int Result = 0;
+  kbts_u8 *Gvar = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_GVAR, kbts_u8);
+  kbts_u8 *Glyf = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_GLYF, kbts_u8);
+  kbts_u8 *Loca = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_LOCA, kbts_u8);
+  kbts__head *Head = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_HEAD, kbts__head);
+  kbts__hea *Hea = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_HHEA, kbts__hea);
+  kbts__long_mtx *LongMetrics = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_HMTX, kbts__long_mtx);
+  kbts__fvar *Fvar = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_FVAR, kbts__fvar);
+
+  KBTS__ZERO_TYPE(Context);
+
+  if(Gvar && Glyf && Loca && Head && Hea && LongMetrics && Fvar)
+  {
+    Context->Gvar = Gvar;
+    Context->GvarEnd = Gvar + Header->Tables[KBTS_BLOB_TABLE_ID_GVAR].Length;
+    Context->Glyf = Glyf;
+    Context->GlyfEnd = Glyf + Header->Tables[KBTS_BLOB_TABLE_ID_GLYF].Length;
+    Context->Loca = Loca;
+    Context->LocaEnd = Loca + Header->Tables[KBTS_BLOB_TABLE_ID_LOCA].Length;
+    Context->LocaIsShort = (Head->IndexToLocFormat == 0);
+    Context->GlyphCount = Header->GlyphCount;
+
+    if(((kbts_u16)Head->IndexToLocFormat <= 1) &&
+       ((kbts_u16)Head->GlyphDataFormat <= 1) &&
+       kbts__CheckedOffset(Loca, 0, kbts__ArraySize(Context->GlyphCount + 1, Context->LocaIsShort ? 2 : 4), (char *)Loca, (char *)Context->LocaEnd) &&
+       kbts__CheckedOffset(Gvar, 0, 20, (char *)Gvar, (char *)Context->GvarEnd) &&
+       (kbts__ReadBigU16(Gvar) == 1))
+    {
+      Context->GvarAxisCount = kbts__ReadBigU16(Gvar + 4);
+      Context->SharedTupleCount = kbts__ReadBigU16(Gvar + 6);
+      Context->LongOffsets = kbts__ReadBigU16(Gvar + 14) & 1;
+      Context->SharedTuples = (kbts_u8 *)kbts__CheckedOffset(Gvar, kbts__ReadBigU32(Gvar + 8), kbts__ArraySize(Context->SharedTupleCount, Context->GvarAxisCount * 2), (char *)Gvar, (char *)Context->GvarEnd);
+      Context->GlyphVariationDataOffsets = (kbts_u8 *)kbts__CheckedOffset(Gvar, 20, kbts__ArraySize(Context->GlyphCount + 1, Context->LongOffsets ? 4 : 2), (char *)Gvar, (char *)Context->GvarEnd);
+      Context->GlyphVariationData = (kbts_u8 *)kbts__CheckedOffset(Gvar, kbts__ReadBigU32(Gvar + 16), 0, (char *)Gvar, (char *)Context->GvarEnd);
+
+      Result = Context->SharedTuples && Context->GlyphVariationDataOffsets && Context->GlyphVariationData;
+    }
+
+    // hmtxvmtx::accelerator_t. kbts_PlaceBlob proved 1 <= MetricCount and that the long
+    // metrics fit; HarfBuzz's bearing count is maxp's glyph count, cut to what hmtx holds.
+    kbts_un MtxLength = Header->Tables[KBTS_BLOB_TABLE_ID_HMTX].Length & ~(kbts_un)1;
+    Context->LongMetrics = LongMetrics;
+    Context->LongMetricCount = Hea->MetricCount;
+    Context->Bearings = (kbts_s16 *)(LongMetrics + Hea->MetricCount);
+    MtxLength -= Context->LongMetricCount * sizeof(kbts__long_mtx);
+    Context->BearingCount = KBTS__MAX(Context->GlyphCount, Context->LongMetricCount);
+    if((Context->BearingCount - Context->LongMetricCount) * 2 > MtxLength)
+    {
+      Context->BearingCount = Context->LongMetricCount + MtxLength / 2;
+    }
+
+    kbts_un UnitsPerEm = Head->UnitsPerEm;
+    Context->FailedAdvance = (kbts_s32)(((UnitsPerEm >= 16) && (UnitsPerEm <= 16384)) ? UnitsPerEm : 1000) / 2;
+
+    Context->VariationVectorNormalized = VariationVectorNormalized;
+    Context->FvarAxisCount = Fvar->AxisCount;
+
+    if(Result && VariationVectorNormalized)
+    {
+      Result = 0;
+
+      KBTS__FOR(AxisIndex, 0, Context->FvarAxisCount)
+      {
+        if(VariationVectorNormalized[AxisIndex])
+        {
+          Result = 1;
+        }
+      }
+    }
+  }
+
+  return Result;
+}
+
+// kbts_PlaceBlob's check of gvar, glyf and loca, run after head, maxp, hhea, hmtx and
+// fvar are swapped. It drops all three when they cannot give advances, and every glyph
+// then keeps its hmtx advance:
+//   - a table-level check of kbts__BeginPhantomAdvances fails;
+//   - a glyph's variation data is broken: it lies past gvar, or a tuple's data, private
+//     points or deltas do not fit where HarfBuzz would fail that glyph. Every tuple of
+//     every glyph is read here, so no tuple can fail when shaping reads it;
+//   - the glyphs ask for more work than KBTS_PHANTOM_OPS_FACTOR per byte of gvar and
+//     glyf, or 2^24 for one glyph, which bounds the work shaping does per glyph.
+// A glyph whose own glyf data is broken does not break the tables: HarfBuzz gives it a
+// defined advance (unitsPerEm / 2, or 0), and kb gives the same.
+static void kbts__CheckPhantomTables(kbts_blob_header *Header)
+{
+  kbts__phantom_context Context;
+  int Keep = kbts__BeginPhantomAdvances(&Context, Header, 0);
+
+  Context.CheckWorkLeft = ((kbts_s64)Header->Tables[KBTS_BLOB_TABLE_ID_GVAR].Length +
+                           (kbts_s64)Header->Tables[KBTS_BLOB_TABLE_ID_GLYF].Length) * KBTS_PHANTOM_OPS_FACTOR;
+
+  KBTS__FOR(GlyphId, 0, Keep ? Context.GlyphCount : 0)
+  {
+    kbts__glyf_glyph Glyph = kbts__GlyfGlyph(&Context, GlyphId);
+    kbts_un PointCount = 0;
+    int Applies = 1;
+
+    Context.GlyphWorkLeft = KBTS__PHANTOM_GLYPH_OPS;
+
+    // HarfBuzz reads no variation data for an invalid glyph, or for a simple glyph
+    // whose end points it cannot read.
+    switch(Glyph.Kind)
+    {
+    case KBTS__GLYF_GLYPH_INVALID: Applies = 0; break;
+    case KBTS__GLYF_GLYPH_SIMPLE:
+    {
+      PointCount = kbts__SimpleGlyphPointCount(&Glyph);
+      Applies = PointCount != 0;
+    } break;
+    case KBTS__GLYF_GLYPH_COMPOSITE:
+    {
+      PointCount = kbts__CompositeGlyphPointCount(&Glyph);
+      Keep = kbts__SpendPhantomCheckWork(&Context, PointCount);
+    } break;
+    }
+
+    if(Keep && Applies)
+    {
+      Keep = kbts__ApplyPhantomDeltas(&Context, GlyphId, PointCount, 0, 0);
+    }
+
+    if(!Keep)
+    {
+      break;
+    }
+  }
+
+  if(!Keep)
+  {
+    Header->Tables[KBTS_BLOB_TABLE_ID_GVAR].Length = 0;
+    Header->Tables[KBTS_BLOB_TABLE_ID_GLYF].Length = 0;
+    Header->Tables[KBTS_BLOB_TABLE_ID_LOCA].Length = 0;
+  }
+}
+
+// The tables that give glyph advances (hmtx or vmtx, HVAR, and gvar's phantom points),
+// looked up once for a shaping pass or a kbts_GetGlyphAdvanceX call.
+typedef struct kbts__advance_context
+{
+  kbts__hea *Hea;
+  kbts__long_mtx *LongMetrics; // 0 without the hea and mtx tables of the orientation.
+  // :LeftSideBearing
+  // kbts_s16 *ShortMetrics;
+  kbts_s32 DefaultAdvance;
+  kbts__hvar_vvar_common *Hvar;
+  kbts__item_variation_store *HvarStore;
+  kbts_s16 *VariationVectorNormalized;
+  kbts_b32 PhantomAdvances;
+  kbts__phantom_context Phantom;
+} kbts__advance_context;
+
+static void kbts__BeginAdvances(kbts__advance_context *Context, kbts_blob_header *Blob, kbts_u32 Orientation, kbts_s16 *VariationVectorNormalized)
+{
+  kbts_blob_table_id HeaTableId = KBTS_BLOB_TABLE_ID_HHEA;
+  kbts_blob_table_id MtxTableId = KBTS_BLOB_TABLE_ID_HMTX;
+  if(Orientation == KBTS_ORIENTATION_VERTICAL)
+  {
+    HeaTableId = KBTS_BLOB_TABLE_ID_VHEA;
+    MtxTableId = KBTS_BLOB_TABLE_ID_VMTX;
+  }
+
+  Context->Hea = kbts__BlobTableDataType(Blob, HeaTableId, kbts__hea);
+  kbts_u16 *Mtx = kbts__BlobTableDataType(Blob, MtxTableId, kbts_u16);
+  Context->Hvar = kbts__BlobTableDataType(Blob, KBTS_BLOB_TABLE_ID_HVAR, kbts__hvar_vvar_common);
+  Context->HvarStore = Context->Hvar ? KBTS__POINTER_OFFSET(kbts__item_variation_store, Context->Hvar, Context->Hvar->ItemVariationStoreOffset) : 0;
+  Context->VariationVectorNormalized = VariationVectorNormalized;
+
+  Context->LongMetrics = 0;
+  if(Context->Hea && Mtx)
+  {
+    Context->LongMetrics = (kbts__long_mtx *)Mtx;
+    // :LeftSideBearing
+    // Context->ShortMetrics = (kbts_s16 *)(Context->LongMetrics + Context->Hea->MetricCount);
+  }
+
+  Context->DefaultAdvance = 1024;
+  kbts__head *Head = kbts__BlobTableDataType(Blob, KBTS_BLOB_TABLE_ID_HEAD, kbts__head);
+  if(Head)
+  {
+    Context->DefaultAdvance = Head->UnitsPerEm;
+    if(Orientation == KBTS_ORIENTATION_HORIZONTAL)
+    {
+      Context->DefaultAdvance /= 2;
+    }
+  }
+
+  // HarfBuzz takes the advances from gvar only when the font has no HVAR, and only
+  // horizontal ones here: vertical phantom points are not done.
+  Context->PhantomAdvances = 0;
+  if(!Context->Hvar && Context->LongMetrics && (Orientation == KBTS_ORIENTATION_HORIZONTAL))
+  {
+    Context->PhantomAdvances = kbts__BeginPhantomAdvances(&Context->Phantom, Blob, VariationVectorNormalized);
+  }
+}
+
+// Advance + the HVAR delta of glyph GlyphId at the instance.
+static kbts_s32 kbts__HvarAdvance(kbts__advance_context *Context, kbts_u32 GlyphId, kbts_s32 Advance)
+{
+  kbts__hvar_vvar_common *Hvar = Context->Hvar;
+  kbts_un OuterIndex = 0;
+  kbts_un InnerIndex = (kbts_un)GlyphId;
+
+  if(Hvar->AdvanceWidthMappingOffset)
+  {
+    kbts__delta_set_index_map *AdvanceIndexMap = KBTS__POINTER_OFFSET(kbts__delta_set_index_map, Hvar, Hvar->AdvanceWidthMappingOffset);
+    kbts_un MapCount = 0;
+    char *Map = 0;
+
+    switch(AdvanceIndexMap->Format)
+    {
+    case 0:
+    {
+      kbts_u16 *MapCount_ = KBTS__POINTER_AFTER(kbts_u16, AdvanceIndexMap);
+
+      // The map can sit at an odd offset in HVAR.
+      MapCount = kbts__ReadU16Unaligned(MapCount_);
+      Map = KBTS__POINTER_AFTER(char, MapCount_);
+    } break;
+
+    case 1:
+    {
+      kbts_u32 *MapCount_ = KBTS__POINTER_AFTER(kbts_u32, AdvanceIndexMap);
+
+      MapCount = kbts__ReadU32Unaligned(MapCount_);
+      Map = KBTS__POINTER_AFTER(char, MapCount_);
+    } break;
+    }
+
+    if(MapCount)
+    {
+      kbts_un MapLookupIndex = (InnerIndex < MapCount) ? InnerIndex : (MapCount - 1);
+      kbts_un BytesPerEntry = kbts__DeltaSetIndexMapBytesPerEntry(AdvanceIndexMap);
+      kbts_un BitsPerInnerIndex = kbts__DeltaSetIndexMapBitsPerInnerIndex(AdvanceIndexMap);
+
+      char *AtLookupEntry = Map + MapLookupIndex * BytesPerEntry;
+      kbts_u32 LookupEntry = 0;
+      switch(BytesPerEntry)
+      {
+      case 1: LookupEntry = *(kbts_u8 *)AtLookupEntry; break;
+      case 2: LookupEntry = kbts__ReadU16Unaligned((kbts_u16 *)AtLookupEntry); break;
+      case 4: LookupEntry = kbts__ReadU32Unaligned((kbts_u32 *)AtLookupEntry); break;
+      }
+
+      InnerIndex = LookupEntry & ((1 << BitsPerInnerIndex) - 1);
+      OuterIndex = LookupEntry >> BitsPerInnerIndex;
+    }
+  }
+
+  float Delta = kbts__ItemVariationStoreDelta(Context->HvarStore, OuterIndex, InnerIndex, Context->VariationVectorNormalized);
+  kbts_s32 RoundedDelta = kbts__Round32(Delta);
+
+  // HarfBuzz gives max(0, advance + round(delta)). The sum is not narrowed to the
+  // 16 bits of the hmtx advance: a 32-bit (LONG_WORDS) delta can take it past
+  // 65535. It is capped at 2^24, the largest range in which a float delta holds
+  // every integer, so the GPOS sums that start from this advance keep room
+  // before kbts_s32 overflows.
+  if(RoundedDelta <= -Advance)
+  {
+    Advance = 0;
+  }
+  else if(RoundedDelta >= (1 << 24) - Advance)
+  {
+    Advance = 1 << 24;
+  }
+  else
+  {
+    Advance += RoundedDelta;
+  }
+
+  return Advance;
+}
+
+// The advance of glyph GlyphId: from hmtx (or vmtx), then with the HVAR delta when the
+// font has HVAR, else from gvar's phantom points when the blob has them (a variable
+// font without HVAR, at a non-default instance). A Hidden glyph (a default ignorable)
+// starts from 0 and keeps 0 without HVAR.
+static kbts_s32 kbts__GlyphAdvance(kbts__advance_context *Context, kbts_u32 GlyphId, kbts_b32 Hidden)
+{
+  kbts_s32 Advance = Context->DefaultAdvance;
+
+  if(Context->LongMetrics)
+  {
+    if(Hidden)
+    {
+      Advance = 0;
+      // :LeftSideBearing
+      // Metric.PreviousSideBearing = 0;
+    }
+    else if(GlyphId < Context->Hea->MetricCount)
+    {
+      Advance = Context->LongMetrics[GlyphId].Advance;
+    }
+    else
+    {
+      Advance = Context->LongMetrics[Context->Hea->MetricCount - 1].Advance;
+      // :LeftSideBearing
+      // Metric.PreviousSideBearing = Context->ShortMetrics[GlyphId - Context->Hea->MetricCount];
+    }
+  }
+
+  if(Context->Hvar)
+  {
+    Advance = kbts__HvarAdvance(Context, GlyphId, Advance);
+  }
+  else if(Context->PhantomAdvances && !Hidden)
+  {
+    Advance = kbts__PhantomAdvanceX(&Context->Phantom, GlyphId);
+  }
+
+  return Advance;
+}
+
 static kbts_glyph_classes kbts__GlyphClasses(kbts_font *Font, kbts_u32 Id)
 {
   kbts_glyph_classes Result = KBTS__ZERO;
@@ -22986,152 +24430,26 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
       kbts_b32 ClearMarkAdvances = (Config->Shaper == KBTS_SHAPER_MYANMAR) || (Config->Shaper == KBTS_SHAPER_USE);
 
       kbts_u32 Orientation = KBTS_ORIENTATION_HORIZONTAL; // @Hardcoded
-      kbts_blob_table_id HeaTableId = KBTS_BLOB_TABLE_ID_HHEA;
-      kbts_blob_table_id MtxTableId = KBTS_BLOB_TABLE_ID_HMTX;
-      if(Orientation == KBTS_ORIENTATION_VERTICAL)
-      {
-        HeaTableId = KBTS_BLOB_TABLE_ID_VHEA;
-        MtxTableId = KBTS_BLOB_TABLE_ID_VMTX;
-      }
-
-      kbts__hea *Hea = kbts__BlobTableDataType(Font->Blob, HeaTableId, kbts__hea);
-      kbts_u16 *Mtx = kbts__BlobTableDataType(Font->Blob, MtxTableId, kbts_u16);
-      kbts__hvar_vvar_common *Hvar = kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_HVAR, kbts__hvar_vvar_common);
-      kbts__item_variation_store *HvarStore = Hvar ? KBTS__POINTER_OFFSET(kbts__item_variation_store, Hvar, Hvar->ItemVariationStoreOffset) : 0;
-      kbts_s16 *VariationVectorNormalized = Scratchpad->VariationVectorNormalized;
-
-      kbts__long_mtx *LongMetrics = 0;
-      // :LeftSideBearing
-      // kbts_s16 *ShortMetrics = 0;
-      if(Hea && Mtx)
-      {
-        LongMetrics = (kbts__long_mtx *)Mtx;
-        // :LeftSideBearing
-        // ShortMetrics = (kbts_s16 *)(LongMetrics + Hea->MetricCount);
-      }
-
-      kbts__long_mtx DefaultMetric = {1024, 0};
-      kbts__head *Head = kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_HEAD, kbts__head);
-      if(Head)
-      {
-        DefaultMetric.Advance = Head->UnitsPerEm;
-        if(Orientation == KBTS_ORIENTATION_HORIZONTAL)
-        {
-          DefaultMetric.Advance /= 2;
-        }
-      }
+      kbts__advance_context Advances;
+      kbts__BeginAdvances(&Advances, Font->Blob, Orientation, Scratchpad->VariationVectorNormalized);
 
       KBTS__FOR_GLYPH(Storage, Glyph)
       {
         kbts__SetCursiveFlags(Glyph, 0);
 
-        kbts__long_mtx Metric = DefaultMetric;
-        if(LongMetrics)
-        {
-          kbts_u32 Id = Glyph->Id;
-
-          // At the end of shaping, default ignorable glyphs that are not generated by GSUB are replaced with zero-width
-          // whitespace glyphs (or a zero-width empty glyph if no whitespace glyph is present).
-          // (By the way, we do this because Harfbuzz does it, and Harfbuzz does it probably because Uniscribe does it.)
-          // We handle this in two steps:
-          // - The first is here. We want cursive attachments, and mark-to-base attachments, and other relative placements
-          //   to take the zero width into account, and zeroing the width right at the beginning of GPOS is the most
-          //   straighforward way to accomplish this.
-          //   (@Incomplete: It is likely that we also need to take the default ignorable case into account when accumulating
-          //    cursive offsets.)
-          // - In POST_GPOS_FIXUP, we perform the glyph ID substitution. We have to wait until all GPOS features have been
-          //   executed to do this because they might possibly match the original ID.
-          if(!(Glyph->Flags & KBTS_GLYPH_FLAG_GENERATED_BY_GSUB) && (Glyph->UnicodeFlags & KBTS_UNICODE_FLAG_DEFAULT_IGNORABLE))
-          {
-            Metric.Advance = 0;
-            // :LeftSideBearing
-            // Metric.PreviousSideBearing = 0;
-          }
-          else if(Id < Hea->MetricCount)
-          {
-            Metric = LongMetrics[Id];
-          }
-          else
-          {
-            Metric.Advance = LongMetrics[Hea->MetricCount - 1].Advance;
-            // :LeftSideBearing
-            // Metric.PreviousSideBearing = ShortMetrics[Id - Hea->MetricCount];
-          }
-        }
-
-        kbts_s32 Advance = Metric.Advance;
-        if(Hvar)
-        {
-          kbts_un OuterIndex = 0;
-          kbts_un InnerIndex = (kbts_un)Glyph->Id;
-
-          if(Hvar->AdvanceWidthMappingOffset)
-          {
-            kbts__delta_set_index_map *AdvanceIndexMap = KBTS__POINTER_OFFSET(kbts__delta_set_index_map, Hvar, Hvar->AdvanceWidthMappingOffset);
-            kbts_un MapCount = 0;
-            char *Map = 0;
-
-            switch(AdvanceIndexMap->Format)
-            {
-            case 0:
-            {
-              kbts_u16 *MapCount_ = KBTS__POINTER_AFTER(kbts_u16, AdvanceIndexMap);
-
-              // The map can sit at an odd offset in HVAR.
-              MapCount = kbts__ReadU16Unaligned(MapCount_);
-              Map = KBTS__POINTER_AFTER(char, MapCount_);
-            } break;
-
-            case 1:
-            {
-              kbts_u32 *MapCount_ = KBTS__POINTER_AFTER(kbts_u32, AdvanceIndexMap);
-
-              MapCount = kbts__ReadU32Unaligned(MapCount_);
-              Map = KBTS__POINTER_AFTER(char, MapCount_);
-            } break;
-            }
-
-            if(MapCount)
-            {
-              kbts_un MapLookupIndex = (InnerIndex < MapCount) ? InnerIndex : (MapCount - 1);
-              kbts_un BytesPerEntry = kbts__DeltaSetIndexMapBytesPerEntry(AdvanceIndexMap);
-              kbts_un BitsPerInnerIndex = kbts__DeltaSetIndexMapBitsPerInnerIndex(AdvanceIndexMap);
-
-              char *AtLookupEntry = Map + MapLookupIndex * BytesPerEntry;
-              kbts_u32 LookupEntry = 0;
-              switch(BytesPerEntry)
-              {
-              case 1: LookupEntry = *(kbts_u8 *)AtLookupEntry; break;
-              case 2: LookupEntry = kbts__ReadU16Unaligned((kbts_u16 *)AtLookupEntry); break;
-              case 4: LookupEntry = kbts__ReadU32Unaligned((kbts_u32 *)AtLookupEntry); break;
-              }
-
-              InnerIndex = LookupEntry & ((1 << BitsPerInnerIndex) - 1);
-              OuterIndex = LookupEntry >> BitsPerInnerIndex;
-            }
-          }
-
-          float Delta = kbts__ItemVariationStoreDelta(HvarStore, OuterIndex, InnerIndex, VariationVectorNormalized);
-          kbts_s32 RoundedDelta = kbts__Round32(Delta);
-
-          // HarfBuzz gives max(0, advance + round(delta)). The sum is not narrowed to the
-          // 16 bits of the hmtx advance: a 32-bit (LONG_WORDS) delta can take it past
-          // 65535. It is capped at 2^24, the largest range in which a float delta holds
-          // every integer, so the GPOS sums that start from this advance keep room
-          // before kbts_s32 overflows.
-          if(RoundedDelta <= -Advance)
-          {
-            Advance = 0;
-          }
-          else if(RoundedDelta >= (1 << 24) - Advance)
-          {
-            Advance = 1 << 24;
-          }
-          else
-          {
-            Advance += RoundedDelta;
-          }
-        }
+        // At the end of shaping, default ignorable glyphs that are not generated by GSUB are replaced with zero-width
+        // whitespace glyphs (or a zero-width empty glyph if no whitespace glyph is present).
+        // (By the way, we do this because Harfbuzz does it, and Harfbuzz does it probably because Uniscribe does it.)
+        // We handle this in two steps:
+        // - The first is here. We want cursive attachments, and mark-to-base attachments, and other relative placements
+        //   to take the zero width into account, and zeroing the width right at the beginning of GPOS is the most
+        //   straighforward way to accomplish this.
+        //   (@Incomplete: It is likely that we also need to take the default ignorable case into account when accumulating
+        //    cursive offsets.)
+        // - In POST_GPOS_FIXUP, we perform the glyph ID substitution. We have to wait until all GPOS features have been
+        //   executed to do this because they might possibly match the original ID.
+        kbts_b32 Hidden = !(Glyph->Flags & KBTS_GLYPH_FLAG_GENERATED_BY_GSUB) && (Glyph->UnicodeFlags & KBTS_UNICODE_FLAG_DEFAULT_IGNORABLE);
+        kbts_s32 Advance = kbts__GlyphAdvance(&Advances, Glyph->Id, Hidden);
 
         if(!ClearMarkAdvances | (Glyph->Classes.Class != KBTS__GLYPH_CLASS_MARK))
         {
@@ -26158,6 +27476,21 @@ KBTS_EXPORT int kbts_GetVariationInstance(kbts_font *Font, int InstanceIndex, kb
   return Result;
 }
 
+KBTS_EXPORT int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s16 *VariationVectorNormalized)
+{
+  int Result = 0;
+
+  if(Font && Font->Blob)
+  {
+    // The same tables and the same code as the metrics pass of shaping.
+    kbts__advance_context Advances;
+    kbts__BeginAdvances(&Advances, Font->Blob, KBTS_ORIENTATION_HORIZONTAL, VariationVectorNormalized);
+    Result = kbts__GlyphAdvance(&Advances, GlyphId, 0);
+  }
+
+  return Result;
+}
+
 KBTS_INLINE int kbts__IsNan32(float X)
 {
   int Result = (X != X);
@@ -28866,6 +30199,9 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
           case KBTS_FOURCC('M', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_MVAR; break;
           case KBTS_FOURCC('H', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_HVAR; break;
           case KBTS_FOURCC('V', 'V', 'A', 'R'): TableId = KBTS_BLOB_TABLE_ID_VVAR; break;
+          case KBTS_FOURCC('g', 'v', 'a', 'r'): TableId = KBTS_BLOB_TABLE_ID_GVAR; break;
+          case KBTS_FOURCC('g', 'l', 'y', 'f'): TableId = KBTS_BLOB_TABLE_ID_GLYF; break;
+          case KBTS_FOURCC('l', 'o', 'c', 'a'): TableId = KBTS_BLOB_TABLE_ID_LOCA; break;
           }
 
           if(TableId)
@@ -28875,6 +30211,22 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
             ReadTable->Length = TableLength;
           }
         }
+      }
+
+      // gvar, glyf and loca give the advances of a variable font only when it has no
+      // HVAR (kbts__PhantomAdvanceX), and they are often the largest tables of a font,
+      // so the blob holds them only then. A font whose HVAR is present but broken loses
+      // HVAR in kbts_PlaceBlob, and then has its hmtx advances, where HarfBuzz would
+      // fall back to gvar: the directory alone cannot tell a broken HVAR.
+      if(!State->Tables[KBTS_BLOB_TABLE_ID_GVAR].Length ||
+         !State->Tables[KBTS_BLOB_TABLE_ID_GLYF].Length ||
+         !State->Tables[KBTS_BLOB_TABLE_ID_LOCA].Length ||
+         !State->Tables[KBTS_BLOB_TABLE_ID_FVAR].Length ||
+         State->Tables[KBTS_BLOB_TABLE_ID_HVAR].Length)
+      {
+        KBTS__ZERO_TYPE(&State->Tables[KBTS_BLOB_TABLE_ID_GVAR]);
+        KBTS__ZERO_TYPE(&State->Tables[KBTS_BLOB_TABLE_ID_GLYF]);
+        KBTS__ZERO_TYPE(&State->Tables[KBTS_BLOB_TABLE_ID_LOCA]);
       }
 
       // Size the lookup and subtable counts that kbts_PlaceBlob bakes matrices for. The
@@ -28968,10 +30320,16 @@ KBTS_EXPORT kbts_load_font_error kbts_LoadFont(kbts_font *Font, kbts_load_font_s
 
       // kbts_PlaceBlob swaps every table through kbts__byteswap_context, one at a time,
       // with two bytes of state per byte of the table, so it needs room for the largest.
+      // gvar, glyf and loca are not swapped.
       kbts_u64 ScratchSize = 0;
       KBTS__FOR(TableId, 0, KBTS_BLOB_TABLE_ID_COUNT)
       {
-        ScratchSize = KBTS__MAX(ScratchSize, (kbts_u64)State->Tables[TableId].Length * 2);
+        if((TableId != KBTS_BLOB_TABLE_ID_GVAR) &&
+           (TableId != KBTS_BLOB_TABLE_ID_GLYF) &&
+           (TableId != KBTS_BLOB_TABLE_ID_LOCA))
+        {
+          ScratchSize = KBTS__MAX(ScratchSize, (kbts_u64)State->Tables[TableId].Length * 2);
+        }
       }
 
       // The matrices have one bit per glyph and lookup, and per glyph and subtable. Their
@@ -29582,6 +30940,10 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
         kbts__EndByteSwapTable(Header, &ByteSwapContext, TableId, &Result);
       }
     }
+
+    // gvar, glyf and loca are not swapped; they are checked, and dropped together when
+    // they cannot give advances.
+    kbts__CheckPhantomTables(Header);
 
     {
       kbts__mvar *Mvar = (kbts__mvar *)kbts__BeginByteSwapTable(&ByteSwapContext, Header, KBTS_BLOB_TABLE_ID_MVAR);
