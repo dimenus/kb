@@ -24465,8 +24465,14 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
       AxisCount = (kbts_un)AxisCountS;
     }
 
-    kbts_s16 VariationVectorNormalized[KBTS__MAX_VARIATION_AXIS_COUNT];
-    kbts_NormalizeVariationVector(Font, VariationVector, VariationVectorNormalized);
+    // The normalized vector is read only by feature variations, which are used only when the font has fewer
+    // than KBTS__MAX_VARIATION_AXIS_COUNT axes (see FeatureVariations below). kbts_NormalizeVariationVector
+    // writes one value per fvar axis, so normalizing for a font with more axes overflowed this array.
+    kbts_s16 VariationVectorNormalized[KBTS__MAX_VARIATION_AXIS_COUNT] = KBTS__ZERO;
+    if(VariationVector && (AxisCount < KBTS__MAX_VARIATION_AXIS_COUNT))
+    {
+      kbts_NormalizeVariationVector(Font, VariationVector, VariationVectorNormalized);
+    }
 
     kbts__murmur_state Murmur;
     kbts__MurmurBegin(&Murmur, 0xBfACB51B);
@@ -25498,11 +25504,17 @@ KBTS_EXPORT float kbts_FontMetric(kbts_font *Font, kbts_u32 Tag, float *Variatio
 
           // @Temporary @Cleanup!
           kbts__variation_region_list *VariationRegionList = KBTS__POINTER_OFFSET(kbts__variation_region_list, Store, kbts__ReadU32Unaligned(Store_VariationRegionListOffset));
-          KBTS_ASSERT(VariationRegionList->AxisCount <= 64);
-          kbts_s16 VariationVectorNormalized[64];
-          kbts_NormalizeVariationVector(Font, VariationVector, (kbts_s16 *)VariationVectorNormalized);
+          // kbts_NormalizeVariationVector writes one value per fvar axis, and the delta reads one per region-list
+          // axis; a font with more axes than this array holds gets no variation delta.
+          kbts_s16 VariationVectorNormalized[64] = KBTS__ZERO;
+          int FvarAxisCount = 0;
+          kbts_GetVariationInfo(Font, &FvarAxisCount, 0);
+          if((FvarAxisCount <= 64) && (VariationRegionList->AxisCount <= 64))
+          {
+            kbts_NormalizeVariationVector(Font, VariationVector, (kbts_s16 *)VariationVectorNormalized);
 
-          Result = kbts__ItemVariationStoreDelta(Store, FoundValueRecord->DeltaSetOuterIndex, FoundValueRecord->DeltaSetInnerIndex, VariationVectorNormalized);
+            Result = kbts__ItemVariationStoreDelta(Store, FoundValueRecord->DeltaSetOuterIndex, FoundValueRecord->DeltaSetInnerIndex, VariationVectorNormalized);
+          }
         }
       }
       else
