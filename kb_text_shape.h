@@ -18480,8 +18480,12 @@ static kbts__arena_block *kbts__ArenaPushBlock(kbts_arena *Arena, kbts_un Size, 
       }
       else
       {
-        Result = (kbts__arena_block *)&Arena->BlockSentinel;
+        // Do not link the sentinel to itself. Inserting it drops every block
+        // already on this arena, so kbts_DestroyShapeContext cannot free them,
+        // and writing Used through the sentinel clears Arena->Error.
         Arena->Error = 1;
+
+        return (kbts__arena_block *)&Arena->BlockSentinel;
       }
     }
     else
@@ -25563,18 +25567,30 @@ KBTS_EXPORT int kbts_ShapeSetFontVariations(kbts_shape_context *Context, kbts_u3
   return kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, 0);
 }
 
-static void kbts__InitializeContextFont(kbts_shape_context *Context, kbts__context_font *ContextFont, kbts_font *Font)
+// Returns 0 when a variable font's variation vector could not be allocated.
+// A static font has no axes; the zero-length push stays, and a null vector is
+// not written. The caller pops the font before setting Context->Error, because
+// kbts_ShapePopFont does nothing once the context is tagged.
+static int kbts__InitializeContextFont(kbts_shape_context *Context, kbts__context_font *ContextFont, kbts_font *Font)
 {
   ContextFont->Info.Font = Font;
 
   int AxisCount;
   kbts_GetVariationInfo(Font, &AxisCount, 0);
   ContextFont->Info.VariationVector = kbts__PushArray(&Context->FontArena, float, AxisCount);
+  if(AxisCount > 0 && !ContextFont->Info.VariationVector)
+  {
+    return 0;
+  }
+
+  return 1;
 }
 
 KBTS_EXPORT kbts_font *kbts_ShapePushFont2(kbts_shape_context *Context, kbts_font *Font, kbts_variation *Variations, int VariationCount, kbts_u32 *ContextFontHandle_)
 {
   kbts_u32 ContextFontHandle = 0xFFFF0000u;
+
+  kbts_font *Result = 0;
 
   if(!Context->Error)
   {
@@ -25582,9 +25598,16 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFont2(kbts_shape_context *Context, kbts_fon
 
     if(ContextFont)
     {
-      kbts__InitializeContextFont(Context, ContextFont, Font);
-
-      kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+      if(kbts__InitializeContextFont(Context, ContextFont, Font))
+      {
+        kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+        Result = Font;
+      }
+      else
+      {
+        kbts_ShapePopFont(Context);
+        Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+      }
     }
   }
 
@@ -25593,13 +25616,13 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFont2(kbts_shape_context *Context, kbts_fon
     *ContextFontHandle_ = ContextFontHandle;
   }
 
-  return Font;
+  return Result;
 }
 
 KBTS_EXPORT kbts_font *kbts_ShapePushFont(kbts_shape_context *Context, kbts_font *Font)
 {
   kbts_font *Result = kbts_ShapePushFont2(Context, Font, 0, 0, 0);
-  return Font;
+  return Result;
 }
 
 KBTS_EXPORT kbts_font *kbts_ShapePopFont(kbts_shape_context *Context)
@@ -25643,14 +25666,29 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromFile2(kbts_shape_context *Context, 
 
       if(!Result->Error)
       {
-        kbts__InitializeContextFont(Context, ContextFont, Result);
-
-        kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+        if(kbts__InitializeContextFont(Context, ContextFont, Result))
+        {
+          kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+        }
+        else
+        {
+          kbts_ShapePopFont(Context);
+          Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+          Result = 0;
+        }
       }
       else
       {
+        // An invalid file is not an out-of-memory context (that case is separate).
+        // A failed allocation is: the arena error is permanent, so leave the
+        // context tagged or kbts_ShapeError stays NONE while later calls fail.
+        kbts_load_font_error LoadError = Result->Error;
         kbts_ShapePopFont(Context);
         Result = 0;
+        if(LoadError == KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY)
+        {
+          Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+        }
       }
     }
     else
@@ -25702,14 +25740,28 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromMemory2(kbts_shape_context *Context
 
         if(!Error)
         {
-          kbts__InitializeContextFont(Context, ContextFont, Result);
-
-          kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+          if(kbts__InitializeContextFont(Context, ContextFont, Result))
+          {
+            kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+          }
+          else
+          {
+            kbts_ShapePopFont(Context);
+            Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+            Result = 0;
+          }
         }
         else
         {
+          // PlaceBlob returns OUT_OF_MEMORY when the scratch or output push
+          // came back null. Pop first: pop does nothing after the context is
+          // tagged. An invalid font does not tag the context.
           kbts_ShapePopFont(Context);
           Result = 0;
+          if(Error == KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY)
+          {
+            Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+          }
         }
       }
       else
@@ -27297,6 +27349,12 @@ static kbts_shape_config *kbts__FindOrCreateShapeConfig(kbts_shape_context *Cont
     }
 
     Result = kbts_CreateShapeConfig2(FontInfo->Font, Script, Language, FontInfo->VariationVector, kbts__ArenaAllocator, &Context->ConfigArena, 0);
+    if(!Result)
+    {
+      Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+      return 0;
+    }
 
     KBTS_ASSERT(Last->Count < KBTS__EXISTING_SHAPE_CONFIGS_PER_BLOCK);
     kbts__existing_shape_config *NewExisting = &Last->Items[Last->Count++];
@@ -27364,6 +27422,12 @@ static kbts_glyph_config *kbts__FindOrCreateGlyphConfig(kbts_shape_context *Cont
       }
 
       Result = kbts_CreateGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount, kbts__ArenaAllocator, &Context->ConfigArena);
+      if(!Result)
+      {
+        Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+        return 0;
+      }
 
       KBTS_ASSERT(Last->Count < KBTS__EXISTING_GLYPH_CONFIGS_PER_BLOCK);
       kbts__existing_glyph_config *Existing = &Last->Items[Last->Count++];
@@ -27499,8 +27563,24 @@ static int kbts__ShapeRun(kbts_shape_context *Context, kbts_run *Run, int Versio
 
             // Initialize the shape_config now, before pushing glyphs.
             ShapeConfig = kbts__FindOrCreateShapeConfig(Context, RunFontInfo, RunScript, Language);
+            // A failed config is 0. Text with no direction yet reads
+            // ShapeConfig->Shaper below, and a new script on a warm context
+            // passes it to kbts__SequentialLookupCount. Either is a null
+            // dereference, and the run would otherwise come back as success.
+            if(!ShapeConfig)
+            {
+              Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+              return 0;
+            }
 
             kbts_glyph_config *GlyphConfig = kbts__FindOrCreateGlyphConfig(Context, ShapeConfig, InputCodepoint->FeatureOverrides, InputCodepoint->FeatureOverrideCount);
+            // 0 is a normal glyph config when this codepoint has no feature
+            // overrides. An allocation failure sets Context->Error.
+            if(Context->Error)
+            {
+              return 0;
+            }
             kbts_PushGlyph(&Context->GlyphStorage, RunFontInfo->Font, InputCodepoint->Codepoint, GlyphConfig, InputCodepointIndex);
 
             Initialized = 1;
@@ -27512,9 +27592,22 @@ static int kbts__ShapeRun(kbts_shape_context *Context, kbts_run *Run, int Versio
           if(!ShapeConfig)
           {
             ShapeConfig = kbts__FindOrCreateShapeConfig(Context, RunFontInfo, RunScript, Language);
+            // Same failure as the initialize path above: "!" and a leading
+            // space have no script and no direction, so the run reads
+            // ShapeConfig->Shaper once the codepoints are pushed.
+            if(!ShapeConfig)
+            {
+              Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+              return 0;
+            }
           }
 
           kbts_glyph_config *GlyphConfig = kbts__FindOrCreateGlyphConfig(Context, ShapeConfig, InputCodepoint->FeatureOverrides, InputCodepoint->FeatureOverrideCount);
+          if(Context->Error)
+          {
+            return 0;
+          }
           kbts_PushGlyph(&Context->GlyphStorage, RunFontInfo->Font, InputCodepoint->Codepoint, GlyphConfig, InputCodepointIndex);
         }
       }
@@ -29412,9 +29505,16 @@ KBTS_EXPORT kbts_font kbts_FontFromMemory(void *FileData, int FileSize, int Font
       void *ScratchMemory = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)ScratchSize);
       void *OutputMemory = kbts__AllocatorAllocate(Allocator, AllocatorData, (kbts_un)OutputSize);
 
-      kbts_PlaceBlob(&Result, &LoadFontState, ScratchMemory, OutputMemory);
+      kbts_load_font_error PlaceError = kbts_PlaceBlob(&Result, &LoadFontState, ScratchMemory, OutputMemory);
 
       kbts__AllocatorFree(Allocator, AllocatorData, ScratchMemory);
+      // PlaceBlob clears Font->Blob on failure, so kbts_FreeFont cannot free
+      // OutputMemory. A scratch allocation that fails on its own is the case:
+      // the output buffer was allocated and would otherwise stay live.
+      if(PlaceError != KBTS_LOAD_FONT_ERROR_NONE)
+      {
+        kbts__AllocatorFree(Allocator, AllocatorData, OutputMemory);
+      }
 
       Result.Allocator = Allocator;
       Result.AllocatorData = AllocatorData;
