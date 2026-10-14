@@ -25567,18 +25567,30 @@ KBTS_EXPORT int kbts_ShapeSetFontVariations(kbts_shape_context *Context, kbts_u3
   return kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, 0);
 }
 
-static void kbts__InitializeContextFont(kbts_shape_context *Context, kbts__context_font *ContextFont, kbts_font *Font)
+// Returns 0 when a variable font's variation vector could not be allocated.
+// A static font has no axes; the zero-length push stays, and a null vector is
+// not written. The caller pops the font before setting Context->Error, because
+// kbts_ShapePopFont does nothing once the context is tagged.
+static int kbts__InitializeContextFont(kbts_shape_context *Context, kbts__context_font *ContextFont, kbts_font *Font)
 {
   ContextFont->Info.Font = Font;
 
   int AxisCount;
   kbts_GetVariationInfo(Font, &AxisCount, 0);
   ContextFont->Info.VariationVector = kbts__PushArray(&Context->FontArena, float, AxisCount);
+  if(AxisCount > 0 && !ContextFont->Info.VariationVector)
+  {
+    return 0;
+  }
+
+  return 1;
 }
 
 KBTS_EXPORT kbts_font *kbts_ShapePushFont2(kbts_shape_context *Context, kbts_font *Font, kbts_variation *Variations, int VariationCount, kbts_u32 *ContextFontHandle_)
 {
   kbts_u32 ContextFontHandle = 0xFFFF0000u;
+
+  kbts_font *Result = 0;
 
   if(!Context->Error)
   {
@@ -25586,9 +25598,16 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFont2(kbts_shape_context *Context, kbts_fon
 
     if(ContextFont)
     {
-      kbts__InitializeContextFont(Context, ContextFont, Font);
-
-      kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+      if(kbts__InitializeContextFont(Context, ContextFont, Font))
+      {
+        kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+        Result = Font;
+      }
+      else
+      {
+        kbts_ShapePopFont(Context);
+        Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+      }
     }
   }
 
@@ -25597,13 +25616,13 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFont2(kbts_shape_context *Context, kbts_fon
     *ContextFontHandle_ = ContextFontHandle;
   }
 
-  return Font;
+  return Result;
 }
 
 KBTS_EXPORT kbts_font *kbts_ShapePushFont(kbts_shape_context *Context, kbts_font *Font)
 {
   kbts_font *Result = kbts_ShapePushFont2(Context, Font, 0, 0, 0);
-  return Font;
+  return Result;
 }
 
 KBTS_EXPORT kbts_font *kbts_ShapePopFont(kbts_shape_context *Context)
@@ -25647,9 +25666,16 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromFile2(kbts_shape_context *Context, 
 
       if(!Result->Error)
       {
-        kbts__InitializeContextFont(Context, ContextFont, Result);
-
-        kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+        if(kbts__InitializeContextFont(Context, ContextFont, Result))
+        {
+          kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+        }
+        else
+        {
+          kbts_ShapePopFont(Context);
+          Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+          Result = 0;
+        }
       }
       else
       {
@@ -25706,9 +25732,16 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromMemory2(kbts_shape_context *Context
 
         if(!Error)
         {
-          kbts__InitializeContextFont(Context, ContextFont, Result);
-
-          kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+          if(kbts__InitializeContextFont(Context, ContextFont, Result))
+          {
+            kbts__ShapeSetFontVariations(Context, ContextFontHandle, Variations, VariationCount, KBTS__SHAPE_SET_FONT_VARIATIONS_FLAG_SET_TO_DEFAULT_IF_NOT_EXPLICITLY_SET);
+          }
+          else
+          {
+            kbts_ShapePopFont(Context);
+            Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+            Result = 0;
+          }
         }
         else
         {
