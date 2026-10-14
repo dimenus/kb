@@ -14054,6 +14054,10 @@ struct kbts_shape_config
   // Thai
   kbts_glyph Nikhahit;
   kbts_glyph SaraAa;
+
+  // The font has GPOS mark positioning for this script. Without it, Hebrew falls back to presentation-form
+  // compositions, as Harfbuzz does (see kbts__RecompositionAllowed).
+  kbts_b32 HasGposMark;
 };
 
 static const kbts_u8 kbts__CmapFormatPrecedence[14] = {1, 0, 1, 0, 2, 0, 1, 0, 3, 0, 3, 0, 4, 5};
@@ -21233,6 +21237,51 @@ static void kbts__FreeGlyphBucket(kbts_shape_scratchpad *Scratchpad, kbts_un Seq
   }
 }
 
+// Composites that have a two-codepoint canonical decomposition but that Unicode normalization never composes
+// (CompositionExclusions.txt, plus the post-composition-version and non-starter exclusions). Unicode 16.0.
+static const kbts_u32 kbts__CompositionExclusions[85] = {
+  0x0344, 0x0958, 0x0959, 0x095A, 0x095B, 0x095C, 0x095D, 0x095E, 0x095F, 0x09DC, 0x09DD, 0x09DF, 0x0A33,
+  0x0A36, 0x0A59, 0x0A5A, 0x0A5B, 0x0A5E, 0x0B5C, 0x0B5D, 0x0F43, 0x0F4D, 0x0F52, 0x0F57, 0x0F5C, 0x0F69,
+  0x0F73, 0x0F75, 0x0F76, 0x0F78, 0x0F81, 0x0F93, 0x0F9D, 0x0FA2, 0x0FA7, 0x0FAC, 0x0FB9, 0x2ADC, 0xFB1D,
+  0xFB1F, 0xFB2A, 0xFB2B, 0xFB2C, 0xFB2D, 0xFB2E, 0xFB2F, 0xFB30, 0xFB31, 0xFB32, 0xFB33, 0xFB34, 0xFB35,
+  0xFB36, 0xFB38, 0xFB39, 0xFB3A, 0xFB3B, 0xFB3C, 0xFB3E, 0xFB40, 0xFB41, 0xFB43, 0xFB44, 0xFB46, 0xFB47,
+  0xFB48, 0xFB49, 0xFB4A, 0xFB4B, 0xFB4C, 0xFB4D, 0xFB4E, 0x1D15E, 0x1D15F, 0x1D160, 0x1D161, 0x1D162,
+  0x1D163, 0x1D164, 0x1D1BB, 0x1D1BC, 0x1D1BD, 0x1D1BE, 0x1D1BF, 0x1D1C0,
+};
+
+static kbts_b32 kbts__IsCompositionExcluded(kbts_u32 Codepoint)
+{
+  kbts_un Low = 0;
+  kbts_un High = KBTS__ARRAY_LENGTH(kbts__CompositionExclusions);
+  while(Low < High)
+  {
+    kbts_un Mid = Low + (High - Low) / 2;
+    if(kbts__CompositionExclusions[Mid] < Codepoint) Low = Mid + 1;
+    else High = Mid;
+  }
+  kbts_b32 Result = (Low < KBTS__ARRAY_LENGTH(kbts__CompositionExclusions)) && (kbts__CompositionExclusions[Low] == Codepoint);
+  return Result;
+}
+
+// Recomposition follows Unicode normalization: an excluded composite is never formed, so the font's own
+// mark positioning applies to the decomposed sequence. The exceptions are Harfbuzz's:
+// - Hebrew (hb-ot-shaper-hebrew.cc, compose_hebrew): when the font has no GPOS mark positioning, the Hebrew
+//   presentation forms U+FB1D..FB4F (all 34 of them are excluded composites) are formed when the font has
+//   them, because old fonts draw pointed letters only that way.
+// - Indic (hb-ot-shaper-indic.cc, compose_indic): BENGALI LETTER YYA U+09DF is always recomposed from
+//   U+09AF U+09BC.
+static kbts_b32 kbts__RecompositionAllowed(kbts_shape_config *Config, kbts_u32 Parent)
+{
+  kbts_b32 Result = 1;
+  if(kbts__IsCompositionExcluded(Parent))
+  {
+    Result = ((Config->Shaper == KBTS_SHAPER_HEBREW) && !Config->HasGposMark &&
+              (Parent >= 0xFB1D) && (Parent <= 0xFB4F)) ||
+             ((Config->Shaper == KBTS_SHAPER_INDIC) && (Parent == 0x09DF));
+  }
+  return Result;
+}
+
 static void kbts__LoadParents(kbts_glyph *Glyph, kbts_glyph_parent *Parents, kbts_un *ParentCount_, kbts_u32 *ParentsLoaded_)
 {
   kbts_s32 *ParentDeltas = kbts__GetParentInfoDeltas(Glyph->ParentInfo);
@@ -21576,7 +21625,8 @@ static void kbts__ExecuteOp(kbts_shape_scratchpad *Scratchpad, kbts_glyph_storag
 
                 if(!(LastBaseParentsLoaded & (1u << ParentIndex)))
                 {
-                  ParentId = (kbts_u16)kbts_CodepointToGlyphId(Font, (int)Parent->Codepoint);
+                  ParentId = kbts__RecompositionAllowed(Config, Parent->Codepoint) ?
+                             (kbts_u16)kbts_CodepointToGlyphId(Font, (int)Parent->Codepoint) : 0;
                   LastBaseParentIds[ParentIndex] = ParentId;
                 }
 
@@ -24769,6 +24819,11 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
                   {
                     // These must properly map KBTS__FEATURE_ID to kbts_glyph_flags!
                     BakedFeature.GlyphFilter = (1u << (FeatureId - 1)) & KBTS__GLYPH_FEATURE_MASK;
+                  }
+
+                  if((ShapingTable == KBTS_SHAPING_TABLE_GPOS) && (FeatureId == KBTS__FEATURE_ID_mark))
+                  {
+                    Config.HasGposMark = 1;
                   }
 
                   BakedFeatures[BakedFeatureCount] = BakedFeature;
