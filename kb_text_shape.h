@@ -25679,8 +25679,16 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromFile2(kbts_shape_context *Context, 
       }
       else
       {
+        // An invalid file is not an out-of-memory context (that case is separate).
+        // A failed allocation is: the arena error is permanent, so leave the
+        // context tagged or kbts_ShapeError stays NONE while later calls fail.
+        kbts_load_font_error LoadError = Result->Error;
         kbts_ShapePopFont(Context);
         Result = 0;
+        if(LoadError == KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY)
+        {
+          Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+        }
       }
     }
     else
@@ -25745,8 +25753,15 @@ KBTS_EXPORT kbts_font *kbts_ShapePushFontFromMemory2(kbts_shape_context *Context
         }
         else
         {
+          // PlaceBlob returns OUT_OF_MEMORY when the scratch or output push
+          // came back null. Pop first: pop does nothing after the context is
+          // tagged. An invalid font does not tag the context.
           kbts_ShapePopFont(Context);
           Result = 0;
+          if(Error == KBTS_LOAD_FONT_ERROR_OUT_OF_MEMORY)
+          {
+            Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+          }
         }
       }
       else
