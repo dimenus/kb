@@ -18444,7 +18444,7 @@ KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int ICodepoint)
 
       // The Microsoft documentation doesn't mention that the SubHeaderKeys are indices multiplied by 8, for some
       // reason..! The Apple documentation does.
-      kbts_u16 SubHeaderIndex = Cmap2->SubHeaderKeys[High] / 8;
+      kbts_u16 SubHeaderIndex = kbts__ReadU16Unaligned(&Cmap2->SubHeaderKeys[High]) / 8;
       kbts__sub_header *SubHeader = &SubHeaders[SubHeaderIndex];
 
       if(!SubHeaderIndex)
@@ -18457,15 +18457,15 @@ KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int ICodepoint)
         Codepoint = Codepoint & 0xFF;
       }
 
-      kbts_u32 Offset = Codepoint - SubHeader->FirstCode;
-      if(Offset < SubHeader->EntryCount)
+      kbts_u32 Offset = Codepoint - kbts__ReadU16Unaligned(&SubHeader->FirstCode);
+      if(Offset < kbts__ReadU16Unaligned(&SubHeader->EntryCount))
       {
-        kbts_u16 *GlyphIds = KBTS__POINTER_OFFSET(kbts_u16, &SubHeader->IdRangeOffset, SubHeader->IdRangeOffset);
-        kbts_un GlyphId = GlyphIds[Offset];
+        kbts_u16 *GlyphIds = KBTS__POINTER_OFFSET(kbts_u16, &SubHeader->IdRangeOffset, kbts__ReadU16Unaligned(&SubHeader->IdRangeOffset));
+        kbts_un GlyphId = kbts__ReadU16Unaligned(&GlyphIds[Offset]);
 
         if(GlyphId)
         {
-          GlyphId += SubHeader->IdDelta;
+          GlyphId += kbts__ReadS16Unaligned(&SubHeader->IdDelta);
         }
 
         Result = (kbts_u16)GlyphId;
@@ -18475,21 +18475,24 @@ KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int ICodepoint)
     case 4:
     {
       kbts__cmap_4 *Cmap4 = (kbts__cmap_4 *)CmapBase;
-      kbts_un SegmentCount = Cmap4->SegmentCountTimesTwo / 2;
+      kbts_un SegmentCount = kbts__ReadU16Unaligned(&Cmap4->SegmentCountTimesTwo) / 2;
       kbts_u16 *EndCodes = KBTS__POINTER_AFTER(kbts_u16, Cmap4);
       kbts_u16 *StartCodes = EndCodes + SegmentCount + 1;
       kbts_s16 *IdDeltas = (kbts_s16 *)(StartCodes + SegmentCount);
       kbts_u16 *IdRangeOffsets = (kbts_u16 *)(IdDeltas + SegmentCount);
       kbts_un SegmentIndexOffset = 0;
 
-      if(SegmentCount)
+      // With no segments there is no segment to read: every codepoint maps to 0.
+      if(!SegmentCount)
       {
-        while(SegmentCount > 1)
-        {
-          kbts_un HalfCount = SegmentCount / 2;
-          SegmentIndexOffset = (kbts__ReadU16Unaligned(&EndCodes[SegmentIndexOffset + HalfCount - 1]) < Codepoint) ? (SegmentIndexOffset + HalfCount) : SegmentIndexOffset;
-          SegmentCount -= HalfCount;
-        }
+        break;
+      }
+
+      while(SegmentCount > 1)
+      {
+        kbts_un HalfCount = SegmentCount / 2;
+        SegmentIndexOffset = (kbts__ReadU16Unaligned(&EndCodes[SegmentIndexOffset + HalfCount - 1]) < Codepoint) ? (SegmentIndexOffset + HalfCount) : SegmentIndexOffset;
+        SegmentCount -= HalfCount;
       }
 
       kbts_u16 Start = kbts__ReadU16Unaligned(&StartCodes[SegmentIndexOffset]);
@@ -18501,7 +18504,7 @@ KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int ICodepoint)
         kbts_u16 GlyphId = (kbts_u16)Delta;
         if(RangeOffset)
         {
-          GlyphId += *(&IdRangeOffsets[SegmentIndexOffset] + (Codepoint - Start) + RangeOffset / 2);
+          GlyphId += kbts__ReadU16Unaligned(&IdRangeOffsets[SegmentIndexOffset] + (Codepoint - Start) + RangeOffset / 2);
         }
         else
         {
@@ -18516,10 +18519,10 @@ KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int ICodepoint)
       kbts__cmap_6 *Cmap6 = (kbts__cmap_6 *)CmapBase;
       kbts_u16 *GlyphIds = KBTS__POINTER_AFTER(kbts_u16, Cmap6);
 
-      kbts_un Offset = Codepoint - Cmap6->FirstCode;
-      if(Offset < Cmap6->EntryCount)
+      kbts_un Offset = Codepoint - kbts__ReadU16Unaligned(&Cmap6->FirstCode);
+      if(Offset < kbts__ReadU16Unaligned(&Cmap6->EntryCount))
       {
-        Result = GlyphIds[Offset];
+        Result = kbts__ReadU16Unaligned(&GlyphIds[Offset]);
       }
     } break;
 
@@ -18529,21 +18532,26 @@ KBTS_EXPORT int kbts_CodepointToGlyphId(kbts_font *Font, int ICodepoint)
       kbts__sequential_map_group *Groups = KBTS__POINTER_AFTER(kbts__sequential_map_group, Cmap12);
 
       kbts_un GlyphId = 0;
-      kbts_un GroupCount = Cmap12->GroupCount;
-      if(GroupCount)
+      kbts_un GroupCount = kbts__ReadU32Unaligned(&Cmap12->GroupCount);
+
+      // With no groups there is no group to read: every codepoint maps to 0.
+      if(!GroupCount)
       {
-        while(GroupCount > 1)
-        {
-          kbts_un HalfCount = GroupCount / 2;
-          Groups = (Groups[HalfCount - 1].EndCharacterCode < Codepoint) ? (Groups + HalfCount) : Groups;
-          GroupCount -= HalfCount;
-        }
+        break;
       }
 
-      if((Codepoint >= Groups->StartCharacterCode) && (Codepoint <= Groups->EndCharacterCode))
+      while(GroupCount > 1)
       {
-        kbts_un Offset = Codepoint - Groups->StartCharacterCode;
-        GlyphId = Groups->StartGlyphId + Offset;
+        kbts_un HalfCount = GroupCount / 2;
+        Groups = (kbts__ReadU32Unaligned(&Groups[HalfCount - 1].EndCharacterCode) < Codepoint) ? (Groups + HalfCount) : Groups;
+        GroupCount -= HalfCount;
+      }
+
+      kbts_un StartCharacterCode = kbts__ReadU32Unaligned(&Groups->StartCharacterCode);
+      if((Codepoint >= StartCharacterCode) && (Codepoint <= kbts__ReadU32Unaligned(&Groups->EndCharacterCode)))
+      {
+        kbts_un Offset = Codepoint - StartCharacterCode;
+        GlyphId = kbts__ReadU32Unaligned(&Groups->StartGlyphId) + Offset;
       }
 
       Result = (int)GlyphId;
