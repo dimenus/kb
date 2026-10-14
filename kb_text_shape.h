@@ -18480,8 +18480,12 @@ static kbts__arena_block *kbts__ArenaPushBlock(kbts_arena *Arena, kbts_un Size, 
       }
       else
       {
-        Result = (kbts__arena_block *)&Arena->BlockSentinel;
+        // Do not link the sentinel to itself. Inserting it drops every block
+        // already on this arena, so kbts_DestroyShapeContext cannot free them,
+        // and writing Used through the sentinel clears Arena->Error.
         Arena->Error = 1;
+
+        return (kbts__arena_block *)&Arena->BlockSentinel;
       }
     }
     else
@@ -27297,6 +27301,12 @@ static kbts_shape_config *kbts__FindOrCreateShapeConfig(kbts_shape_context *Cont
     }
 
     Result = kbts_CreateShapeConfig2(FontInfo->Font, Script, Language, FontInfo->VariationVector, kbts__ArenaAllocator, &Context->ConfigArena, 0);
+    if(!Result)
+    {
+      Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+      return 0;
+    }
 
     KBTS_ASSERT(Last->Count < KBTS__EXISTING_SHAPE_CONFIGS_PER_BLOCK);
     kbts__existing_shape_config *NewExisting = &Last->Items[Last->Count++];
@@ -27364,6 +27374,12 @@ static kbts_glyph_config *kbts__FindOrCreateGlyphConfig(kbts_shape_context *Cont
       }
 
       Result = kbts_CreateGlyphConfig(ShapeConfig, FeatureOverrides, FeatureOverrideCount, kbts__ArenaAllocator, &Context->ConfigArena);
+      if(!Result)
+      {
+        Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+        return 0;
+      }
 
       KBTS_ASSERT(Last->Count < KBTS__EXISTING_GLYPH_CONFIGS_PER_BLOCK);
       kbts__existing_glyph_config *Existing = &Last->Items[Last->Count++];
@@ -27499,8 +27515,24 @@ static int kbts__ShapeRun(kbts_shape_context *Context, kbts_run *Run, int Versio
 
             // Initialize the shape_config now, before pushing glyphs.
             ShapeConfig = kbts__FindOrCreateShapeConfig(Context, RunFontInfo, RunScript, Language);
+            // A failed config is 0. Text with no direction yet reads
+            // ShapeConfig->Shaper below, and a new script on a warm context
+            // passes it to kbts__SequentialLookupCount. Either is a null
+            // dereference, and the run would otherwise come back as success.
+            if(!ShapeConfig)
+            {
+              Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+              return 0;
+            }
 
             kbts_glyph_config *GlyphConfig = kbts__FindOrCreateGlyphConfig(Context, ShapeConfig, InputCodepoint->FeatureOverrides, InputCodepoint->FeatureOverrideCount);
+            // 0 is a normal glyph config when this codepoint has no feature
+            // overrides. An allocation failure sets Context->Error.
+            if(Context->Error)
+            {
+              return 0;
+            }
             kbts_PushGlyph(&Context->GlyphStorage, RunFontInfo->Font, InputCodepoint->Codepoint, GlyphConfig, InputCodepointIndex);
 
             Initialized = 1;
@@ -27512,9 +27544,22 @@ static int kbts__ShapeRun(kbts_shape_context *Context, kbts_run *Run, int Versio
           if(!ShapeConfig)
           {
             ShapeConfig = kbts__FindOrCreateShapeConfig(Context, RunFontInfo, RunScript, Language);
+            // Same failure as the initialize path above: "!" and a leading
+            // space have no script and no direction, so the run reads
+            // ShapeConfig->Shaper once the codepoints are pushed.
+            if(!ShapeConfig)
+            {
+              Context->Error = KBTS_SHAPE_ERROR_OUT_OF_MEMORY;
+
+              return 0;
+            }
           }
 
           kbts_glyph_config *GlyphConfig = kbts__FindOrCreateGlyphConfig(Context, ShapeConfig, InputCodepoint->FeatureOverrides, InputCodepoint->FeatureOverrideCount);
+          if(Context->Error)
+          {
+            return 0;
+          }
           kbts_PushGlyph(&Context->GlyphStorage, RunFontInfo->Font, InputCodepoint->Codepoint, GlyphConfig, InputCodepointIndex);
         }
       }
