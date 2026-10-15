@@ -1889,7 +1889,11 @@
 #  endif
 
 #  ifndef KB_TEXT_SHAPE_POINTER_SIZE
-#    if defined(i386) || defined(__i386__) || defined(_M_IX86) || defined(_M_ARM) || defined(__arm__) || defined(__x86) || (defined(__APPLE__) && defined(__ppc)) || \
+// The compiler's own answer first (GCC, Clang): the target list below misses 32-bit targets such as
+// wasm32, where a size of 8 makes kbts_un 64-bit and kb's 4-aligned arena blocks misaligned.
+#    if defined(__SIZEOF_POINTER__)
+#      define KB_TEXT_SHAPE_POINTER_SIZE __SIZEOF_POINTER__
+#    elif defined(i386) || defined(__i386__) || defined(_M_IX86) || defined(_M_ARM) || defined(__arm__) || defined(__x86) || (defined(__APPLE__) && defined(__ppc)) || \
       (defined(__TOS_AIX__) && !defined(__64BIT))
 #      define KB_TEXT_SHAPE_POINTER_SIZE 4
 #    else
@@ -1906,6 +1910,10 @@
 #    define kbts_sn kbts_s64
 #    define kbts_uptr kbts_u64
 #  endif
+
+// A pointer size that is not the target's is a compile error here: a wrong one compiles, then makes
+// misaligned arena accesses and shifts as wide as the type (undefined), seen only under UBSan.
+typedef char kbts__pointer_size_matches_target[(KB_TEXT_SHAPE_POINTER_SIZE == sizeof(void *)) ? 1 : -1];
 
 #  ifdef __has_attribute
 #    if __has_attribute(fallthrough)
@@ -28842,7 +28850,8 @@ static kbts__interned_context_font_info *kbts__InternContextFontInfo(kbts_shape_
         kbts__murmur_state Murmur;
         kbts__MurmurBegin(&Murmur, 0x97978573);
         kbts__MurmurAbsorb(&Murmur, (kbts_u32)(kbts_un)FontInfo->Font);
-        kbts__MurmurAbsorb(&Murmur, (kbts_u32)((kbts_un)FontInfo->Font >> 32));
+        // Widened first: a shift by 32 of a 32-bit kbts_un (32-bit targets) is undefined.
+        kbts__MurmurAbsorb(&Murmur, (kbts_u32)((kbts_u64)(kbts_uptr)FontInfo->Font >> 32));
         if(VariationVector)
         {
           for(int AxisIndex = 0;
