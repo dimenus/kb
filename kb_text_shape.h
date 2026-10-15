@@ -21974,6 +21974,9 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
 
           kbts_u16 *Unpacked1Base;
           kbts_u16 *Unpacked2Base;
+          // The device offsets in a value record are from the PairSet in format 1 and from
+          // the subtable in format 2, the same parents the swap pass walks them from.
+          void *DeviceParent = Base;
           kbts_u16 ValueFormat1;
           kbts_u16 ValueFormat2 = 0;
           kbts_un Size1;
@@ -21994,6 +21997,7 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
 
             kbts_u16 *SetOffsets = KBTS__POINTER_AFTER(kbts_u16, Adjust);
             kbts__pair_set *Set = KBTS__POINTER_OFFSET(kbts__pair_set, Adjust, kbts__ReadU16Unaligned(&SetOffsets[Cover.Index]));
+            DeviceParent = Set;
 
             kbts_un PairRecordSize = Size1 + Size2 + 1; // + 1 because each pair stores the next glyph ID.
             kbts__pair_value_record *PairRecords = KBTS__POINTER_AFTER(kbts__pair_value_record, Set);
@@ -22105,7 +22109,7 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
 
             KBTS_INSTRUMENT_BLOCK_BEGIN(ApplyPairPositioning);
 
-            kbts__resolved_value_record ValueRecord1 = kbts__ResolveValueRecord(Scratchpad, Base, ValueFormat1, Unpacked1Base);
+            kbts__resolved_value_record ValueRecord1 = kbts__ResolveValueRecord(Scratchpad, DeviceParent, ValueFormat1, Unpacked1Base);
             kbts__ApplyValueRecord(CurrentGlyph, &ValueRecord1);
 
             CurrentGlyph->Flags |= KBTS_GLYPH_FLAG_USED_IN_GPOS;
@@ -22115,7 +22119,7 @@ static kbts_b32 kbts__DoSingleAdjustment(kbts_shape_scratchpad *Scratchpad, kbts
 
             if(ValueFormat2)
             {
-              kbts__resolved_value_record ValueRecord2 = kbts__ResolveValueRecord(Scratchpad, Base, ValueFormat2, Unpacked2Base);
+              kbts__resolved_value_record ValueRecord2 = kbts__ResolveValueRecord(Scratchpad, DeviceParent, ValueFormat2, Unpacked2Base);
               kbts__ApplyValueRecord(NextGlyph, &ValueRecord2);
               OnePastLastGlyph = NextGlyph->Next;
             }
