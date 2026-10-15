@@ -929,7 +929,24 @@
             and writes out the result to [VariationVectorNormalized].
 
             [VariationVector] and [VariationVectorNormalized] should both be as big as the
-            number of variation axes in [Font].
+            number of variation axes in [Font]. When [Font] has axes, every element of
+            [VariationVectorNormalized] is written; when it has none, nothing is.
+
+            Each coordinate is an F2Dot14 value in [-16384, 16384], for any font data and
+            any value in [VariationVector]. It is computed from fvar and avar as HarfBuzz
+            14.6.0 computes it (hb_ot_var_normalize_coords), except for avar version 2
+            (see above):
+            - A value outside the axis range is clamped to it. An infinite value is
+              clamped like any other. A NaN value is taken as the axis default, so it
+              normalizes to 0.
+            - The axis range is the one kbts_GetVariationAxisInfo reports: a minimum above
+              the default, or a maximum below it, is read as the default, as HarfBuzz reads
+              it. That side of the axis then has no range, and every value there gives 0.
+            - avar's segment maps remap the result. A map that breaks the spec's rules is
+              read with HarfBuzz's recovery rules; an avar with fewer maps than the font
+              has axes remaps only those axes.
+            - HarfBuzz does not clamp the remapped value; kb clamps it to [-16384, 16384].
+              Only an avar whose maps reach past [-1, 1] makes the two differ.
 
           :kbts_GetVariationAxisInfo
           :GetVariationAxisInfo
@@ -937,6 +954,10 @@
                                         kbts_variation_axis_info *Info)
             Gets the description of the [AxisIndex]th variation axis contained in [Font],
             and writes it out to [Info].
+
+            MinimumValue <= DefaultValue <= MaximumValue always holds. Like HarfBuzz
+            (hb_ot_var_get_axis_infos), kb reports an fvar minimum above the default, or
+            an fvar maximum below it, as the default.
 
             Returns 1 if [AxisIndex] is in-bounds.
 
@@ -15510,26 +15531,6 @@ typedef struct kbts__resolved_value_record
   kbts_s16 AdvanceY;
 } kbts__resolved_value_record;
 
-static kbts_s16 kbts__FloatToFixed2_14(float X)
-{
-  kbts_s32 Result;
-
-  if(X <= -1.0f)
-  {
-    Result = 0xC000;
-  }
-  else if(X >= 1.0f)
-  {
-    Result = 0x4000;
-  }
-  else
-  {
-    Result = kbts__Round32(X * (1 << 14));
-  }
-
-  return (kbts_s16)Result;
-}
-
 static float kbts__Fixed2_14ToFloat(kbts_s16 X)
 {
   float Result = (float)X * (1.0f / (float)(1 << 14));
@@ -27504,6 +27505,151 @@ KBTS_EXPORT void kbts_GetVariationInfo(kbts_font *Font, int *AxisCount_, int *In
   }
 }
 
+KBTS_INLINE int kbts__IsNan32(float X)
+{
+  int Result = (X != X);
+  return Result;
+}
+
+// One fvar axis's range as HarfBuzz reads it (AxisRecord::get_coordinates): a minimum above
+// the default is taken as the default, and so is a maximum below it. That side of the axis
+// then has no range, and every value on it normalizes to 0. fvar holds 16.16 fixed-point
+// values, so all three are finite.
+static void kbts__GetAxisRange(kbts__variation_axis_record *Axis, float *Minimum, float *Default, float *Maximum)
+{
+  float AxisDefault = kbts__Fixed16_16ToFloat(Axis->DefaultValue);
+  float AxisMinimum = kbts__Fixed16_16ToFloat(Axis->MinValue);
+  float AxisMaximum = kbts__Fixed16_16ToFloat(Axis->MaxValue);
+
+  *Minimum = (AxisMinimum < AxisDefault) ? AxisMinimum : AxisDefault;
+  *Default = AxisDefault;
+  *Maximum = (AxisMaximum > AxisDefault) ? AxisMaximum : AxisDefault;
+}
+
+// HarfBuzz's roundf, which it defines as floorf(X + 0.5f) (hb-algs.hh): a value halfway
+// between two integers rounds up, also when it is negative, where C's roundf rounds away
+// from zero. The scaling by 65536 is exact. X is in (-5, 5), so the result fits.
+static kbts_s32 kbts__RoundTo16_16(float X)
+{
+  float Scaled = X * 65536.0f;
+  kbts_s32 Result = kbts__Floor32(Scaled + 0.5f);
+  return Result;
+}
+
+// avar's map for one axis, on a value in [-1, 1]. This is SegmentMaps::map_float of HarfBuzz
+// 14.6.0, step for step, so that kb normalizes as HarfBuzz does. The spec asks for at least
+// the entries -1, 0 and 1, in increasing order, with no fromCoordinate twice; HarfBuzz recovers
+// from maps that break that, and so does this:
+// - no entry maps the value to itself; one entry shifts it by that entry's offset;
+// - a leading (-1, -1) entry followed by another -1 entry is skipped, and so is a trailing
+//   (1, 1) entry preceded by another 1 entry;
+// - a value equal to several fromCoordinates takes the middle of three, otherwise the one
+//   closer to 0;
+// - a value before the first entry or after the last one is shifted by that entry's offset,
+//   not clamped.
+// Division happens only between two entries with different fromCoordinates, so the result is
+// finite for any table: a value in [-1, 1] maps into (-5, 5).
+static float kbts__AvarMap(kbts__axis_value_map *Maps, kbts_un MapCount, float Value)
+{
+  float Result = Value;
+
+  if(MapCount == 1)
+  {
+    Result = Value - kbts__Fixed2_14ToFloat(Maps[0].FromCoordinate) + kbts__Fixed2_14ToFloat(Maps[0].ToCoordinate);
+  }
+  else if(MapCount >= 2)
+  {
+    kbts_un Start = 0;
+    kbts_un End = MapCount;
+
+    if((Maps[Start].FromCoordinate == -0x4000) && (Maps[Start].ToCoordinate == -0x4000) && (Maps[Start + 1].FromCoordinate == -0x4000))
+    {
+      Start += 1;
+    }
+    if((Maps[End - 1].FromCoordinate == 0x4000) && (Maps[End - 1].ToCoordinate == 0x4000) && (Maps[End - 2].FromCoordinate == 0x4000))
+    {
+      End -= 1;
+    }
+
+    kbts_un Index = Start;
+    while((Index < End) && (Value != kbts__Fixed2_14ToFloat(Maps[Index].FromCoordinate)))
+    {
+      Index += 1;
+    }
+
+    if(Index < End)
+    {
+      // Maps[Index..Last] all have Value as their fromCoordinate.
+      kbts_un Last = Index;
+      while(((Last + 1) < End) && (Value == kbts__Fixed2_14ToFloat(Maps[Last + 1].FromCoordinate)))
+      {
+        Last += 1;
+      }
+
+      float FirstTo = kbts__Fixed2_14ToFloat(Maps[Index].ToCoordinate);
+      float LastTo = kbts__Fixed2_14ToFloat(Maps[Last].ToCoordinate);
+
+      if(Index == Last)
+      {
+        Result = FirstTo;
+      }
+      else if((Index + 2) == Last)
+      {
+        Result = kbts__Fixed2_14ToFloat(Maps[Index + 1].ToCoordinate);
+      }
+      else if(Value < 0)
+      {
+        Result = LastTo;
+      }
+      else if(Value > 0)
+      {
+        Result = FirstTo;
+      }
+      else
+      {
+        // HarfBuzz follows CoreText here and takes the smaller magnitude.
+        float FirstMagnitude = (FirstTo < 0) ? -FirstTo : FirstTo;
+        float LastMagnitude = (LastTo < 0) ? -LastTo : LastTo;
+        Result = (FirstMagnitude < LastMagnitude) ? FirstTo : LastTo;
+      }
+    }
+    else
+    {
+      Index = Start;
+      while((Index < End) && !(Value < kbts__Fixed2_14ToFloat(Maps[Index].FromCoordinate)))
+      {
+        Index += 1;
+      }
+
+      if(Index == Start)
+      {
+        Result = Value - kbts__Fixed2_14ToFloat(Maps[Start].FromCoordinate) + kbts__Fixed2_14ToFloat(Maps[Start].ToCoordinate);
+      }
+      else if(Index == End)
+      {
+        Result = Value - kbts__Fixed2_14ToFloat(Maps[End - 1].FromCoordinate) + kbts__Fixed2_14ToFloat(Maps[End - 1].ToCoordinate);
+      }
+      else
+      {
+        // Maps[Index - 1].FromCoordinate < Value < Maps[Index].FromCoordinate, so the
+        // denominator is not 0.
+        float From0 = kbts__Fixed2_14ToFloat(Maps[Index - 1].FromCoordinate);
+        float To0 = kbts__Fixed2_14ToFloat(Maps[Index - 1].ToCoordinate);
+        float From1 = kbts__Fixed2_14ToFloat(Maps[Index].FromCoordinate);
+        float To1 = kbts__Fixed2_14ToFloat(Maps[Index].ToCoordinate);
+        float Numerator = (To1 - To0) * (Value - From0);
+        Result = To0 + Numerator / (From1 - From0);
+      }
+    }
+  }
+
+  return Result;
+}
+
+// The arithmetic is HarfBuzz 14.6.0's (hb_ot_var_normalize_coords): the fvar step in float,
+// rounded to 16.16 (kbts__RoundTo16_16); avar's map on that, rounded again; then 16.16 to 2.14
+// by (X + 2) >> 2. HarfBuzz does not clamp the avar result, which a broken avar can push past
+// [-1, 1] (see kbts__AvarMap); kb clamps it, so every coordinate is a valid F2Dot14.
 KBTS_EXPORT void kbts_NormalizeVariationVector(kbts_font *Font, float *VariationVector, kbts_s16 *VariationVectorNormalized)
 {
   if(Font && Font->Blob &&
@@ -27517,115 +27663,67 @@ KBTS_EXPORT void kbts_NormalizeVariationVector(kbts_font *Font, float *Variation
       kbts__variation_axis_record *Axes = KBTS__POINTER_OFFSET(kbts__variation_axis_record, Fvar, Fvar->AxesArrayOffset);
       kbts_un AxisCount = Fvar->AxisCount;
 
-      kbts__segment_maps DummySegmentMaps = KBTS__ZERO;
-      kbts__segment_maps *SegmentMaps = Avar ? KBTS__POINTER_AFTER(kbts__segment_maps, Avar) : &DummySegmentMaps;
+      // avar may map fewer axes than fvar has; the others are not remapped (HarfBuzz's
+      // avar::map_coords_16_16).
+      kbts_un AvarAxisCount = Avar ? Avar->AxisCount : 0;
+      kbts__segment_maps *SegmentMaps = Avar ? KBTS__POINTER_AFTER(kbts__segment_maps, Avar) : 0;
 
       KBTS__FOR(AxisIndex, 0, AxisCount)
       {
-        kbts__variation_axis_record *Axis = &Axes[AxisIndex];
+        float AxisMinimum, AxisDefault, AxisMaximum;
+        kbts__GetAxisRange(&Axes[AxisIndex], &AxisMinimum, &AxisDefault, &AxisMaximum);
 
-        kbts__axis_value_map *AxisValueMaps = KBTS__POINTER_AFTER(kbts__axis_value_map, SegmentMaps);
-        kbts_un PositionMapCount = SegmentMaps->PositionMapCount;
-
-        float AxisMin = kbts__Fixed16_16ToFloat(Axis->MinValue);
-        float AxisDefault = kbts__Fixed16_16ToFloat(Axis->DefaultValue);
-        float AxisMax = kbts__Fixed16_16ToFloat(Axis->MaxValue);
-
-        float InputCoord = VariationVector[AxisIndex];
-
-        if(InputCoord < AxisMin)
+        float Value = VariationVector[AxisIndex];
+        if(kbts__IsNan32(Value))
         {
-          InputCoord = AxisMin;
-        }
-        else if(InputCoord > AxisMax)
-        {
-          InputCoord = AxisMax;
+          Value = AxisDefault;
         }
 
-        float NormalizedInputFloat;
-        if(InputCoord < AxisDefault)
+        if(Value < AxisMinimum)
         {
-          NormalizedInputFloat = -(AxisDefault - InputCoord) / (AxisDefault - AxisMin);
+          Value = AxisMinimum;
         }
-        else if (InputCoord > AxisDefault)
+        else if(Value > AxisMaximum)
         {
-          NormalizedInputFloat = (InputCoord - AxisDefault) / (AxisMax - AxisDefault);
-        }
-        else
-        {
-          NormalizedInputFloat = 0;
+          Value = AxisMaximum;
         }
 
-        #ifdef KBTS__VARIATION_NORMALIZATION_COMPATIBILITY
-        NormalizedInputFloat = (float)kbts__Floor32(NormalizedInputFloat * 65536.0f + 0.5f) / 65536.0f;
-        kbts_s16 NormalizedInputFixed = (kbts_s16)(((kbts_s32)(NormalizedInputFloat * 65536.0f) + 2) >> 2);
-        #else
-        kbts_s16 NormalizedInputFixed = kbts__FloatToFixed2_14(NormalizedInputFloat);
-        #endif
-
-        if(PositionMapCount)
+        // Each branch divides by a range that holds Value, so it is not 0, and the quotient
+        // is in [-1, 1].
+        float Normalized = 0;
+        if(Value < AxisDefault)
         {
-          // @Speed: Binary search?
-          kbts__axis_value_map Last = AxisValueMaps[0];
-          float From0 = kbts__Fixed2_14ToFloat(Last.FromCoordinate);
-
-          #ifdef KBTS__VARIATION_NORMALIZATION_COMPATIBILITY
-          KBTS__FOR(PositionMapIndex, 1, PositionMapCount)
-          {
-            kbts__axis_value_map Current = AxisValueMaps[PositionMapIndex];
-            float From1 = kbts__Fixed2_14ToFloat(Current.FromCoordinate);
-
-            if(From1 >= NormalizedInputFloat)
-            {
-              float To0 = kbts__Fixed2_14ToFloat(Last.ToCoordinate);
-              float To1 = kbts__Fixed2_14ToFloat(Current.ToCoordinate);
-
-              float LerpFactor = (NormalizedInputFloat - From0) / (From1 - From0);
-              float RemappedFloat = To0 + (To1 - To0) * LerpFactor;
-
-              RemappedFloat = (float)kbts__Round32(RemappedFloat * 65536.0f);
-              kbts_s16 RemappedFixed = (kbts_s16)(((kbts_s32)RemappedFloat + 2) >> 2);
-
-              VariationVectorNormalized[AxisIndex] = RemappedFixed;
-
-              break;
-            }
-
-            From0 = From1;
-            Last = Current;
-          }
-          #else
-          KBTS__FOR(PositionMapIndex, 1, PositionMapCount)
-          {
-            kbts__axis_value_map Current = AxisValueMaps[PositionMapIndex];
-
-            if(Current.FromCoordinate >= NormalizedInputFixed)
-            {
-              float From0 = kbts__Fixed2_14ToFloat(Last.FromCoordinate);
-              float To0 = kbts__Fixed2_14ToFloat(Last.ToCoordinate);
-              float From1 = kbts__Fixed2_14ToFloat(Current.FromCoordinate);
-              float To1 = kbts__Fixed2_14ToFloat(Current.ToCoordinate);
-
-              float LerpFactor = (NormalizedInputFloat - From0) / (From1 - From0);
-              float RemappedFloat = To0 + (To1 - To0) * LerpFactor;
-
-              kbts_s16 RemappedFixed = kbts__FloatToFixed2_14(RemappedFloat);
-
-              VariationVectorNormalized[AxisIndex] = RemappedFixed;
-
-              break;
-            }
-
-            Last = Current;
-          }
-          #endif
+          Normalized = (Value - AxisDefault) / (AxisDefault - AxisMinimum);
         }
-        else
+        else if(Value > AxisDefault)
         {
-          VariationVectorNormalized[AxisIndex] = NormalizedInputFixed;
+          Normalized = (Value - AxisDefault) / (AxisMaximum - AxisDefault);
         }
 
-        SegmentMaps = Avar ? (kbts__segment_maps *)(AxisValueMaps + PositionMapCount) : &DummySegmentMaps;
+        kbts_s32 Coordinate = kbts__RoundTo16_16(Normalized);
+
+        if(AxisIndex < AvarAxisCount)
+        {
+          kbts__axis_value_map *AxisValueMaps = KBTS__POINTER_AFTER(kbts__axis_value_map, SegmentMaps);
+          kbts_un PositionMapCount = SegmentMaps->PositionMapCount;
+
+          float Mapped = kbts__AvarMap(AxisValueMaps, PositionMapCount, (float)Coordinate / 65536.0f);
+          Coordinate = kbts__RoundTo16_16(Mapped);
+
+          SegmentMaps = (kbts__segment_maps *)(AxisValueMaps + PositionMapCount);
+        }
+
+        Coordinate = (Coordinate + 2) >> 2;
+        if(Coordinate < -0x4000)
+        {
+          Coordinate = -0x4000;
+        }
+        else if(Coordinate > 0x4000)
+        {
+          Coordinate = 0x4000;
+        }
+
+        VariationVectorNormalized[AxisIndex] = (kbts_s16)Coordinate;
       }
     }
   }
@@ -27645,9 +27743,7 @@ KBTS_EXPORT int kbts_GetVariationAxisInfo(kbts_font *Font, int AxisIndex, kbts_v
       kbts__variation_axis_record *Axis = &Axes[AxisIndex];
 
       Info->Tag = Axis->Tag;
-      Info->MinimumValue = kbts__Fixed16_16ToFloat(Axis->MinValue);
-      Info->DefaultValue = kbts__Fixed16_16ToFloat(Axis->DefaultValue);
-      Info->MaximumValue = kbts__Fixed16_16ToFloat(Axis->MaxValue);
+      kbts__GetAxisRange(Axis, &Info->MinimumValue, &Info->DefaultValue, &Info->MaximumValue);
       Info->Flags = Axis->Flags;
       Info->NameStringId = Axis->AxisNameId;
 
@@ -27714,12 +27810,6 @@ KBTS_EXPORT int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s1
     Result = kbts__GlyphAdvance(&Advances, GlyphId, 0);
   }
 
-  return Result;
-}
-
-KBTS_INLINE int kbts__IsNan32(float X)
-{
-  int Result = (X != X);
   return Result;
 }
 
@@ -31042,8 +31132,10 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
         // kb steps through the axes by sizeof(kbts__variation_axis_record), and
         // kbts_GetVariationInstance by AxisSize: they agree only at 20, the size the
         // OpenType spec gives. An instance holds a name id, flags, and one 32-bit
-        // coordinate per axis, so a smaller instance overlaps the next one.
-        if((Fvar->AxisSize != sizeof(kbts__variation_axis_record)) ||
+        // coordinate per axis, so a smaller instance overlaps the next one. HarfBuzz
+        // reads only major version 1 (fvar::sanitize), and so does kb.
+        if((Fvar->Major != 1) ||
+           (Fvar->AxisSize != sizeof(kbts__variation_axis_record)) ||
            (InstanceSize < (sizeof(kbts__instance_record) + sizeof(kbts__fixed16_16) * AxisCount)))
         {
           ByteSwapContext.Error = 1;
@@ -31088,10 +31180,10 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 
       if(Avar && kbts__Swap16(&ByteSwapContext, Avar, 4))
       {
-        // kbts_NormalizeVariationVector reads one segment map per fvar axis.
-        kbts__fvar *Fvar = kbts__BlobTableDataType(Header, KBTS_BLOB_TABLE_ID_FVAR, kbts__fvar);
-
-        if(Fvar && (Avar->AxisCount < Fvar->AxisCount))
+        // HarfBuzz reads major versions 1 and 2 (avar::sanitize); kb applies version 2's
+        // segment maps only. An avar with fewer segment maps than fvar has axes is kept, as
+        // HarfBuzz keeps it: kbts_NormalizeVariationVector maps the axes it has maps for.
+        if((Avar->Major != 1) && (Avar->Major != 2))
         {
           ByteSwapContext.Error = 1;
         }
