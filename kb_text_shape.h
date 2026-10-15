@@ -14245,6 +14245,13 @@ KBTS_INLINE kbts_u16 kbts__ReadU16Unaligned(const kbts_u16 *Data)
   KBTS_MEMCPY(&Result, (void *)Data, sizeof(kbts_u16));
   return Result;
 }
+// A 24-bit offset, as an And, Or or Negate condition holds them. These bytes are never
+// swapped (kbts__KeepBytes), so they are read as big-endian bytes on every host.
+KBTS_INLINE kbts_un kbts__ReadU24BigEndian(kbts_u8 *Data)
+{
+  kbts_un Result = ((kbts_un)Data[0] << 16) | ((kbts_un)Data[1] << 8) | (kbts_un)Data[2];
+  return Result;
+}
 KBTS_INLINE kbts_s16 kbts__ReadS16Unaligned(kbts_s16 *Data)
 {
   kbts_s16 Result;
@@ -14657,13 +14664,30 @@ typedef struct kbts__fixed16_16
   kbts_s32 Value;
 } kbts__fixed16_16;
 
-typedef struct kbts__condition_1
-{
-  kbts_u16 Format;
-  kbts_u16 AxisIndex;
-  kbts_s16 FilterRangeMinValue;
-  kbts_s16 FilterRangeMaxValue;
-} kbts__condition_1;
+// A condition starts with a 16-bit format, and the rest depends on it:
+//   1, axis range: u16 AxisIndex, F2DOT14 FilterRangeMinValue, F2DOT14 FilterRangeMaxValue.
+//      True when the axis's normalized coordinate (0 for an axis the font does not have)
+//      lies in the range, both ends included.
+//   2, value:      s16 DefaultValue, u32 VarIdx. True when DefaultValue plus the GDEF item
+//      variation store's delta for VarIdx is above 0.
+//   3, and:        u8 Count, then Count 24-bit offsets to conditions. True when all are.
+//   4, or:         u8 Count, then Count 24-bit offsets to conditions. True when one is.
+//   5, negate:     one 24-bit offset to a condition. True when it is not.
+// Offsets are from the start of the condition that holds them (a condition set's 32-bit
+// offsets, from the set). A 0 offset is the true condition, and an unknown format is
+// false: HarfBuzz evaluates both so (Condition::evaluate), and its sanitizer accepts both.
+#define KBTS__CONDITION_FORMAT_AXIS_RANGE 1
+#define KBTS__CONDITION_FORMAT_VALUE 2
+#define KBTS__CONDITION_FORMAT_AND 3
+#define KBTS__CONDITION_FORMAT_OR 4
+#define KBTS__CONDITION_FORMAT_NEGATE 5
+
+// HarfBuzz's sanitizer accepts conditions nested this deep (HB_MAX_NESTING_LEVEL; a
+// condition set's own conditions are at depth 1). A deeper one fails the whole GSUB or
+// GPOS table there, so kb's swap pass drops the table too. It also bounds the recursion:
+// offsets point only forward, so conditions cannot loop, but a chain of them can be as
+// long as the table allows.
+#define KBTS__CONDITION_MAX_DEPTH 64
 
 typedef struct kbts__feature_table_substitution
 {
@@ -16158,8 +16182,6 @@ typedef enum kbts__swap_visit_enum
   KBTS__SWAP_VISIT_FEATURE_LIST,
   KBTS__SWAP_VISIT_FEATURE,
   KBTS__SWAP_VISIT_FEATURE_VARIATIONS,
-  KBTS__SWAP_VISIT_CONDITION_SET,
-  KBTS__SWAP_VISIT_CONDITION,
   KBTS__SWAP_VISIT_FEATURE_SUBSTITUTION,
   KBTS__SWAP_VISIT_LOOKUP_LIST,
   KBTS__SWAP_VISIT_LOOKUP,
@@ -16566,6 +16588,68 @@ static kbts__lookup_list *kbts__ByteSwapLookupList(kbts__byteswap_context *Conte
   return Result;
 }
 
+// Swaps the condition at Parent + Offset, Depth deep, and every condition it holds.
+// Not recorded in Visited: the depth limit is on every path, as HarfBuzz checks it, so a
+// condition is walked again from each parent, the way kbts__ConditionHolds reads it. The
+// swap state makes a second walk change nothing, and WorkLeft bounds the walks, so it
+// also bounds the conditions shaping evaluates, which are never more than these.
+static void kbts__ByteSwapCondition(kbts__byteswap_context *Context, void *Parent, kbts_un Offset, kbts_un Depth)
+{
+  if(Offset && (Depth > KBTS__CONDITION_MAX_DEPTH))
+  {
+    Context->Error = 1;
+  }
+  else if(Offset)
+  {
+    kbts_u16 *Condition = (kbts_u16 *)kbts__SwapOffset(Context, Parent, Offset, sizeof(kbts_u16));
+    kbts_u8 *Bytes = (kbts_u8 *)Condition;
+
+    if(Condition && kbts__Swap16(Context, Condition, 1))
+    {
+      switch(kbts__ReadU16Unaligned(Condition))
+      {
+      case KBTS__CONDITION_FORMAT_AXIS_RANGE:
+      {
+        kbts__Swap16(Context, Bytes + 2, 3);
+      } break;
+
+      case KBTS__CONDITION_FORMAT_VALUE:
+      {
+        if(kbts__Swap16(Context, Bytes + 2, 1))
+        {
+          kbts__Swap32(Context, Bytes + 4, 1);
+        }
+      } break;
+
+      case KBTS__CONDITION_FORMAT_AND:
+      case KBTS__CONDITION_FORMAT_OR:
+      {
+        if(kbts__KeepBytes(Context, Bytes + 2, 1))
+        {
+          kbts_un Count = Bytes[2];
+
+          if(kbts__KeepBytes(Context, Bytes + 3, Count * 3))
+          {
+            KBTS__FOR(ConditionIndex, 0, Count)
+            {
+              kbts__ByteSwapCondition(Context, Condition, kbts__ReadU24BigEndian(Bytes + 3 + ConditionIndex * 3), Depth + 1);
+            }
+          }
+        }
+      } break;
+
+      case KBTS__CONDITION_FORMAT_NEGATE:
+      {
+        if(kbts__KeepBytes(Context, Bytes + 2, 3))
+        {
+          kbts__ByteSwapCondition(Context, Condition, kbts__ReadU24BigEndian(Bytes + 2), Depth + 1);
+        }
+      } break;
+      }
+    }
+  }
+}
+
 static void kbts__ByteSwapGsubGposCommon(kbts__byteswap_context *Context, kbts__gsub_gpos *Header)
 {
   if(!kbts__Swap16(Context, Header, 5) ||
@@ -16686,6 +16770,12 @@ static void kbts__ByteSwapGsubGposCommon(kbts__byteswap_context *Context, kbts__
        kbts__Swap16(Context, FeatureVariations, 2) &&
        kbts__Swap32(Context, &FeatureVariations->RecordCount, 1))
     {
+      // HarfBuzz's sanitizer fails the whole table on another major version.
+      if(FeatureVariations->Major != 1)
+      {
+        Context->Error = 1;
+      }
+
       kbts_un RecordCount = FeatureVariations->RecordCount;
       kbts__feature_variation_record *Records = (kbts__feature_variation_record *)kbts__SwapArrayOffset(Context, FeatureVariations, sizeof(kbts__feature_variations), RecordCount, sizeof(kbts__feature_variation_record));
 
@@ -16696,10 +16786,16 @@ static void kbts__ByteSwapGsubGposCommon(kbts__byteswap_context *Context, kbts__
         {
           kbts__feature_variation_record *Record = &Records[VariationIndex];
 
-          // Shaping reads both offsets without testing for 0.
-          kbts__condition_set *Set = (kbts__condition_set *)kbts__SwapOffset(Context, FeatureVariations, Record->ConditionSetOffset, sizeof(kbts__condition_set));
-          if(kbts__FirstVisit(Context, Set, KBTS__SWAP_VISIT_CONDITION_SET) &&
-             kbts__Swap16(Context, Set, 1))
+          // A 0 offset is an empty condition set, which always holds; shaping reads it so.
+          // Not recorded in Visited, for the reason kbts__ByteSwapCondition gives: a set
+          // that many records share is walked once for each, as shaping evaluates it.
+          kbts__condition_set *Set = 0;
+          if(Record->ConditionSetOffset)
+          {
+            Set = (kbts__condition_set *)kbts__SwapOffset(Context, FeatureVariations, Record->ConditionSetOffset, sizeof(kbts__condition_set));
+          }
+
+          if(Set && kbts__Swap16(Context, Set, 1))
           {
             kbts_un ConditionCount = Set->Count;
             kbts_u32 *ConditionOffsets = KBTS__POINTER_AFTER(kbts_u32, Set);
@@ -16708,20 +16804,27 @@ static void kbts__ByteSwapGsubGposCommon(kbts__byteswap_context *Context, kbts__
             {
               KBTS__FOR(ConditionIndex, 0, ConditionCount)
               {
-                kbts__condition_1 *Condition = (kbts__condition_1 *)kbts__SwapOffset(Context, Set, kbts__ReadU32Unaligned(&ConditionOffsets[ConditionIndex]), sizeof(kbts__condition_1));
-
-                if(kbts__FirstVisit(Context, Condition, KBTS__SWAP_VISIT_CONDITION))
-                {
-                  kbts__Swap16(Context, Condition, 4);
-                }
+                kbts__ByteSwapCondition(Context, Set, kbts__ReadU32Unaligned(&ConditionOffsets[ConditionIndex]), 1);
               }
             }
           }
 
-          kbts__feature_table_substitution *FeatureSubst = (kbts__feature_table_substitution *)kbts__SwapOffset(Context, FeatureVariations, Record->FeatureTableSubstitutionOffset, sizeof(kbts__feature_table_substitution));
+          // A 0 offset substitutes no feature; shaping reads it so.
+          kbts__feature_table_substitution *FeatureSubst = 0;
+          if(Record->FeatureTableSubstitutionOffset)
+          {
+            FeatureSubst = (kbts__feature_table_substitution *)kbts__SwapOffset(Context, FeatureVariations, Record->FeatureTableSubstitutionOffset, sizeof(kbts__feature_table_substitution));
+          }
+
           if(kbts__FirstVisit(Context, FeatureSubst, KBTS__SWAP_VISIT_FEATURE_SUBSTITUTION) &&
              kbts__Swap16(Context, FeatureSubst, 3))
           {
+            // As for the feature variations: HarfBuzz fails the table on another major version.
+            if(FeatureSubst->Major != 1)
+            {
+              Context->Error = 1;
+            }
+
             kbts_un SubstCount = FeatureSubst->Count;
             kbts__feature_table_substitution_record *SubstRecords = (kbts__feature_table_substitution_record *)kbts__SwapArrayOffset(Context, FeatureSubst, sizeof(kbts__feature_table_substitution), SubstCount, sizeof(kbts__feature_table_substitution_record));
 
@@ -26438,6 +26541,129 @@ static void kbts__ShapeConfigUid(kbts_shape_config *Config, kbts_uid *Uid)
   }
 }
 
+typedef struct kbts__condition_context
+{
+  // AxisCount normalized coordinates. Without a variation vector they are all 0, the
+  // default instance, which is what a HarfBuzz font with no variations set has
+  // (hb_font_create sets them), deltas included.
+  kbts_s16 *Coordinates;
+  kbts_un AxisCount;
+  kbts__item_variation_store *GdefStore;
+} kbts__condition_context;
+
+// Whether the condition at Parent + Offset holds. The formats, and why a 0 offset holds,
+// are at KBTS__CONDITION_FORMAT_AXIS_RANGE. kbts__ByteSwapCondition swapped and bounded
+// every condition this reads, on every path, and dropped the table when one was deeper
+// than KBTS__CONDITION_MAX_DEPTH, so the recursion ends.
+static int kbts__ConditionHolds(kbts__condition_context *Context, void *Parent, kbts_un Offset)
+{
+  int Result = 1;
+
+  if(Offset)
+  {
+    kbts_u16 *Condition = KBTS__POINTER_OFFSET(kbts_u16, Parent, Offset);
+    kbts_u8 *Bytes = (kbts_u8 *)Condition;
+
+    switch(kbts__ReadU16Unaligned(Condition))
+    {
+    case KBTS__CONDITION_FORMAT_AXIS_RANGE:
+    {
+      kbts_un AxisIndex = kbts__ReadU16Unaligned((kbts_u16 *)(Bytes + 2));
+      kbts_s16 Min = (kbts_s16)kbts__ReadU16Unaligned((kbts_u16 *)(Bytes + 4));
+      kbts_s16 Max = (kbts_s16)kbts__ReadU16Unaligned((kbts_u16 *)(Bytes + 6));
+      kbts_s16 Coordinate = (AxisIndex < Context->AxisCount) ? Context->Coordinates[AxisIndex] : 0;
+
+      Result = (Min <= Coordinate) && (Coordinate <= Max);
+    } break;
+
+    case KBTS__CONDITION_FORMAT_VALUE:
+    {
+      kbts_s16 DefaultValue = (kbts_s16)kbts__ReadU16Unaligned((kbts_u16 *)(Bytes + 2));
+      kbts_u32 VarIdx = kbts__ReadU32Unaligned((kbts_u32 *)(Bytes + 4));
+      // An outer index of 0xFFFF is past every store, so VarIdx 0xFFFFFFFF (no
+      // variation) has no delta, as in HarfBuzz.
+      float Delta = kbts__ItemVariationStoreDelta(Context->GdefStore, VarIdx >> 16, VarIdx & 0xFFFF, Context->Coordinates);
+
+      Result = ((float)DefaultValue + Delta) > 0;
+    } break;
+
+    case KBTS__CONDITION_FORMAT_AND:
+    case KBTS__CONDITION_FORMAT_OR:
+    {
+      int IsAnd = kbts__ReadU16Unaligned(Condition) == KBTS__CONDITION_FORMAT_AND;
+      kbts_un Count = Bytes[2];
+
+      // And holds until one does not; Or does not until one does.
+      Result = IsAnd;
+      KBTS__FOR(ConditionIndex, 0, Count)
+      {
+        if(kbts__ConditionHolds(Context, Condition, kbts__ReadU24BigEndian(Bytes + 3 + ConditionIndex * 3)) != IsAnd)
+        {
+          Result = !IsAnd;
+          break;
+        }
+      }
+    } break;
+
+    case KBTS__CONDITION_FORMAT_NEGATE:
+    {
+      Result = !kbts__ConditionHolds(Context, Condition, kbts__ReadU24BigEndian(Bytes + 2));
+    } break;
+
+    default:
+    {
+      Result = 0;
+    } break;
+    }
+  }
+
+  return Result;
+}
+
+// The feature table substitution of the first feature variation record whose conditions
+// all hold, or 0. Only that one record applies, even when a later one also holds, and
+// a record with no conditions (or a 0 condition set offset) always holds. This is the
+// OpenType rule, and HarfBuzz's FeatureVariations::find_index.
+static kbts__feature_table_substitution *kbts__FindFeatureTableSubstitution(kbts__condition_context *Context, kbts__feature_variations *FeatureVariations)
+{
+  kbts__feature_table_substitution *Result = 0;
+  kbts__feature_variation_record *Records = KBTS__POINTER_AFTER(kbts__feature_variation_record, FeatureVariations);
+
+  KBTS__FOR(RecordIndex, 0, FeatureVariations->RecordCount)
+  {
+    kbts__feature_variation_record *Record = &Records[RecordIndex];
+    int Holds = 1;
+
+    if(Record->ConditionSetOffset)
+    {
+      kbts__condition_set *Set = KBTS__POINTER_OFFSET(kbts__condition_set, FeatureVariations, Record->ConditionSetOffset);
+      kbts_u32 *ConditionOffsets = KBTS__POINTER_AFTER(kbts_u32, Set);
+
+      KBTS__FOR(ConditionIndex, 0, Set->Count)
+      {
+        if(!kbts__ConditionHolds(Context, Set, kbts__ReadU32Unaligned(&ConditionOffsets[ConditionIndex])))
+        {
+          Holds = 0;
+          break;
+        }
+      }
+    }
+
+    if(Holds)
+    {
+      // A 0 offset substitutes nothing, and still ends the search.
+      if(Record->FeatureTableSubstitutionOffset)
+      {
+        Result = KBTS__POINTER_OFFSET(kbts__feature_table_substitution, FeatureVariations, Record->FeatureTableSubstitutionOffset);
+      }
+
+      break;
+    }
+  }
+
+  return Result;
+}
+
 static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Script, kbts_language Language, float *VariationVector, void *Memory, kbts_un *Size, kbts_uid *Uid)
 {
   kbts_shape_config *Result = 0;
@@ -26470,12 +26696,26 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
     }
 
     // The normalized vector is read only by feature variations, which are used only when the font has fewer
-    // than KBTS__MAX_VARIATION_AXIS_COUNT axes (see FeatureVariations below). kbts_NormalizeVariationVector
+    // than KBTS__MAX_VARIATION_AXIS_COUNT axes (see FeatureTableSubstitution below). kbts_NormalizeVariationVector
     // writes one value per fvar axis, so normalizing for a font with more axes overflowed this array.
     kbts_s16 VariationVectorNormalized[KBTS__MAX_VARIATION_AXIS_COUNT] = KBTS__ZERO;
     if(VariationVector && (AxisCount < KBTS__MAX_VARIATION_AXIS_COUNT))
     {
       kbts_NormalizeVariationVector(Font, VariationVector, VariationVectorNormalized);
+    }
+
+    // Condition format 2 reads deltas from GDEF's item variation store, the store shaping
+    // reads device deltas from (kbts_ShapeDirect2's scratchpad).
+    kbts__item_variation_store *GdefItemVariationStore = 0;
+    {
+      kbts__gdef *Gdef = kbts__BlobTableDataType(Font->Blob, KBTS_BLOB_TABLE_ID_GDEF, kbts__gdef);
+      if(Gdef &&
+         (Gdef->Major == 1) &&
+         (Gdef->Minor >= 3) &&
+         Gdef->ItemVariationStoreOffset)
+      {
+        GdefItemVariationStore = KBTS__POINTER_OFFSET(kbts__item_variation_store, Gdef, Gdef->ItemVariationStoreOffset);
+      }
     }
 
     kbts__murmur_state Murmur;
@@ -26710,14 +26950,21 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
             {
               kbts__feature_list *FeatureList = KBTS__POINTER_OFFSET(kbts__feature_list, GsubGpos, GsubGpos->FeatureListOffset);
               kbts_u16 *FeatureIndices = KBTS__POINTER_AFTER(kbts_u16, Langsys);
-              kbts__feature_variations *FeatureVariations = 0;
+              kbts__feature_table_substitution *FeatureTableSubstitution = 0;
 
+              // Without a variation vector every coordinate is 0, the default instance,
+              // where conditions still choose a record, as they do in HarfBuzz.
               if((GsubGpos->Minor == 1) &&
                  GsubGpos->FeatureVariationsOffset &&
-                 VariationVector &&
                  (AxisCount < KBTS__MAX_VARIATION_AXIS_COUNT))
               {
-                FeatureVariations = KBTS__POINTER_OFFSET(kbts__feature_variations, GsubGpos, GsubGpos->FeatureVariationsOffset);
+                kbts__feature_variations *FeatureVariations = KBTS__POINTER_OFFSET(kbts__feature_variations, GsubGpos, GsubGpos->FeatureVariationsOffset);
+                kbts__condition_context ConditionContext = KBTS__ZERO;
+                ConditionContext.Coordinates = VariationVectorNormalized;
+                ConditionContext.AxisCount = AxisCount;
+                ConditionContext.GdefStore = GdefItemVariationStore;
+
+                FeatureTableSubstitution = kbts__FindFeatureTableSubstitution(&ConditionContext, FeatureVariations);
               }
 
               // @Speed: Maybe we don't care about fragmentation and we just allocate Langsys->FeatureIndexCount in advance?
@@ -26763,51 +27010,21 @@ static kbts_shape_config *kbts__PlaceShapeConfig(kbts_font *Font, kbts_script Sc
 
                 kbts__feature_pointer Feature = kbts__GetFeature(FeatureList, FeatureIndex);
 
-                if(FeatureVariations)
+                if(FeatureTableSubstitution)
                 {
-                  // Substitute features.
-                  // @Speed: This is N-squared and omega slow!
-                  kbts__feature_variation_record *VariationRecords = KBTS__POINTER_AFTER(kbts__feature_variation_record, FeatureVariations);
+                  // The first record for this feature index, as HarfBuzz takes it
+                  // (FeatureTableSubstitution::find_substitute); records need not be sorted.
+                  kbts__feature_table_substitution_record *SubstitutionRecords = KBTS__POINTER_AFTER(kbts__feature_table_substitution_record, FeatureTableSubstitution);
 
-                  KBTS__FOR(VariationIndex, 0, FeatureVariations->RecordCount)
+                  KBTS__FOR(SubstitutionRecordIndex, 0, FeatureTableSubstitution->Count)
                   {
-                    kbts__feature_variation_record *VariationRecord = &VariationRecords[VariationIndex];
-                    kbts__condition_set *ConditionSet = KBTS__POINTER_OFFSET(kbts__condition_set, FeatureVariations, VariationRecord->ConditionSetOffset);
-                    kbts_u32 *ConditionOffsets = KBTS__POINTER_AFTER(kbts_u32, ConditionSet);
+                    kbts__feature_table_substitution_record *SubstitutionRecord = &SubstitutionRecords[SubstitutionRecordIndex];
 
-                    KBTS__FOR(ConditionIndex, 0, ConditionSet->Count)
+                    if(SubstitutionRecord->FeatureIndex == FeatureIndex)
                     {
-                      kbts__condition_1 *Condition = KBTS__POINTER_OFFSET(kbts__condition_1, ConditionSet, kbts__ReadU32Unaligned(&ConditionOffsets[ConditionIndex]));
+                      Feature.Feature = KBTS__POINTER_OFFSET(kbts__feature, FeatureTableSubstitution, SubstitutionRecord->AlternateFeatureOffset);
 
-                      if(Condition->AxisIndex < AxisCount)
-                      {
-                        kbts_s16 Input = VariationVectorNormalized[Condition->AxisIndex];
-
-                        if((Input >= Condition->FilterRangeMinValue) &&
-                           (Input <= Condition->FilterRangeMaxValue))
-                        {
-                          kbts__feature_table_substitution *FeatureTableSubstitution = KBTS__POINTER_OFFSET(kbts__feature_table_substitution, FeatureVariations, VariationRecord->FeatureTableSubstitutionOffset);
-                          kbts__feature_table_substitution_record *SubstitutionRecords = KBTS__POINTER_AFTER(kbts__feature_table_substitution_record, FeatureTableSubstitution);
-
-                          KBTS__FOR(SubstitutionRecordIndex, 0, FeatureTableSubstitution->Count)
-                          {
-                            kbts__feature_table_substitution_record *SubstitutionRecord = &SubstitutionRecords[SubstitutionRecordIndex];
-
-                            if(SubstitutionRecord->FeatureIndex == FeatureIndex)
-                            {
-                              kbts__feature *SubstitutingFeature = KBTS__POINTER_OFFSET(kbts__feature, FeatureTableSubstitution, SubstitutionRecord->AlternateFeatureOffset);
-
-                              Feature.Feature = SubstitutingFeature;
-
-                              break;
-                            }
-                            else if(SubstitutionRecord->FeatureIndex > FeatureIndex)
-                            {
-                              break;
-                            }
-                          }
-                        }
-                      }
+                      break;
                     }
                   }
                 }
