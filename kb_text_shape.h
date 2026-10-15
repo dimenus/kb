@@ -972,6 +972,24 @@
             corresponding to the instance. As such, it must be as big as the number of
             variation axes in [Font].
 
+          :kbts_FontMetric
+          :FontMetric
+          float kbts_FontMetric(kbts_font *Font, kbts_u32 Tag, float *VariationVector)
+            Returns how far the variation instance [VariationVector] moves the font-wide
+            metric that MVAR names [Tag], in font units: the MVAR delta only, not the
+            metric. This is HarfBuzz's hb_ot_metrics_get_variation. The value at the
+            instance is the font's static value (OS/2, hhea, vhea, post) plus this delta.
+
+            [Tag] is an MVAR value tag, such as KBTS_FOURCC('h', 'a', 's', 'c') for the
+            horizontal ascender, 'hdsc', 'hlgp', 'cpht' (cap height) or 'xhgt'.
+            [VariationVector] holds unnormalized coordinates, one per variation axis in
+            [Font], as for kbts_NormalizeVariationVector.
+
+            The [return value] is 0 when [Font] is not valid, when [VariationVector] is 0,
+            when the font has no MVAR table (or kb dropped a broken one), when MVAR has no
+            record for [Tag], and when the font or its MVAR store has more than 64 axes.
+            It is not rounded.
+
           :kbts_GetGlyphAdvanceX
           :GetGlyphAdvanceX
           int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s16 *VariationVectorNormalized)
@@ -27813,6 +27831,9 @@ KBTS_EXPORT int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s1
   return Result;
 }
 
+// The delta only, never the metric itself: the static values live in OS/2, hhea, vhea, post and
+// gasp, and kb does not load post or gasp. Returning the full value for some tags and the delta
+// for the others would make the return value mean two things.
 KBTS_EXPORT float kbts_FontMetric(kbts_font *Font, kbts_u32 Tag, float *VariationVector)
 {
   float Result = 0;
@@ -27861,21 +27882,6 @@ KBTS_EXPORT float kbts_FontMetric(kbts_font *Font, kbts_u32 Tag, float *Variatio
 
             Result = kbts__ItemVariationStoreDelta(Store, FoundValueRecord->DeltaSetOuterIndex, FoundValueRecord->DeltaSetInnerIndex, VariationVectorNormalized);
           }
-        }
-      }
-      else
-      {
-        // No valid variation table. Fall back to static font info.
-        kbts_font_info2_2 Info;
-        Info.Base.Size = sizeof(Info);
-        kbts_GetFontInfo2(Font, &Info.Base);
-
-        switch(Tag)
-        {
-        case KBTS_FOURCC('v', 'a', 's', 'c'): Result = (float)Info.Ascent; break;
-        case KBTS_FOURCC('v', 'd', 's', 'c'): Result = (float)Info.Descent; break;
-        case KBTS_FOURCC('v', 'l', 'g', 'p'): Result = (float)Info.LineGap; break;
-        case KBTS_FOURCC('c', 'p', 'h', 't'): Result = (float)Info.CapitalHeight; break;
         }
       }
     }
