@@ -4723,6 +4723,7 @@ KBTS_EXPORT kbts_font *kbts_ShapePopFont(kbts_shape_context *Context);
 KBTS_EXPORT void kbts_ShapeBegin(kbts_shape_context *Context, kbts_direction ParagraphDirection, kbts_language Language);
 KBTS_EXPORT void kbts_ShapeEnd(kbts_shape_context *Context);
 KBTS_EXPORT int kbts_ShapeRun(kbts_shape_context *Context, kbts_run *Run);
+KBTS_EXPORT int kbts_ShapeRun2(kbts_shape_context *Context, kbts_run2 *Run);
 KBTS_EXPORT void kbts_ShapePushFeature(kbts_shape_context *Context, kbts_u32 FeatureTag, int Value);
 KBTS_EXPORT int kbts_ShapePopFeature(kbts_shape_context *Context, kbts_u32 FeatureTag);
 KBTS_EXPORT void kbts_ShapeCodepoint(kbts_shape_context *Context, int Codepoint);
@@ -4743,6 +4744,7 @@ KBTS_EXPORT int kbts_ShapeCodepointIteratorNext(kbts_shape_codepoint_iterator *I
 KBTS_EXPORT int kbts_ShapeGetShapeCodepoint2(kbts_shape_context *Context, int CodepointIndex, kbts_shape_codepoint2 *Codepoint);
 KBTS_EXPORT int kbts_ShapeGetShapeCodepoint(kbts_shape_context *Context, int CodepointIndex, kbts_shape_codepoint *Codepoint);
 KBTS_EXPORT int kbts_ShapeSetFontVariationVector(kbts_shape_context *Context, kbts_u32 ContextFontHandle, float *VariationVector);
+KBTS_EXPORT int kbts_ShapeSetFontVariations(kbts_shape_context *Context, kbts_u32 ContextFontHandle, kbts_variation *Variations, int VariationCount);
 KBTS_EXPORT int kbts_ShapeSetFontVariation(kbts_shape_context *Context, kbts_u32 ContextFontHandle, kbts_u32 Tag, float Value);
 KBTS_EXPORT int kbts_ShapePushGlobalVariation(kbts_shape_context *Context, kbts_u32 Tag, float Value);
 KBTS_EXPORT int kbts_ShapePopGlobalVariation(kbts_shape_context *Context, kbts_u32 Tag);
@@ -4771,8 +4773,11 @@ KBTS_EXPORT kbts_load_font_error kbts_PlaceBlob(kbts_font *Font, kbts_load_font_
 KBTS_EXPORT void kbts_GetFontInfo2(kbts_font *Font, kbts_font_info2 *Info);
 KBTS_EXPORT void kbts_GetFontInfo(kbts_font *Font, kbts_font_info *Info);
 KBTS_EXPORT void kbts_GetVariationInfo(kbts_font *Font, int *AxisCount, int *InstanceCount);
+KBTS_EXPORT int kbts_GetVariationAxisInfo(kbts_font *Font, int AxisIndex, kbts_variation_axis_info *Info);
+KBTS_EXPORT int kbts_GetVariationInstance(kbts_font *Font, int InstanceIndex, kbts_variation_instance_info *Info, float *VariationVector);
 KBTS_EXPORT void kbts_NormalizeVariationVector(kbts_font *Font, float *VariationVector, kbts_s16 *VariationVectorNormalized);
 KBTS_EXPORT int kbts_GetGlyphAdvanceX(kbts_font *Font, kbts_u32 GlyphId, kbts_s16 *VariationVectorNormalized);
+KBTS_EXPORT float kbts_FontMetric(kbts_font *Font, kbts_u32 Tag, float *VariationVector);
 KBTS_EXPORT int kbts_WindowsIdsForLanguage(kbts_language Language, kbts_windows_language_id *Ids, int IdCapacity);
 KBTS_EXPORT int kbts_LookupFontString(kbts_font *Font, kbts_font_info_string_id StringId, kbts_windows_language_id LanguageId, char *String, int StringCapacity);
 
